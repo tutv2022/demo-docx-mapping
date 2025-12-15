@@ -3,20 +3,20 @@ package com.example.docxprocessor.model;
 import java.util.Map;
 
 public class TemplateData {
-    private Map<String, String> variables;
+    private Map<String, Object> variables;
 
     public TemplateData() {
     }
 
-    public TemplateData(Map<String, String> variables) {
+    public TemplateData(Map<String, Object> variables) {
         this.variables = variables;
     }
 
-    public Map<String, String> getVariables() {
+    public Map<String, Object> getVariables() {
         return variables;
     }
 
-    public void setVariables(Map<String, String> variables) {
+    public void setVariables(Map<String, Object> variables) {
         this.variables = variables;
     }
 }
