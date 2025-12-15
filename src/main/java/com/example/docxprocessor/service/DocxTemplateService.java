@@ -118,6 +118,7 @@ public class DocxTemplateService {
         String fontFamily;
         Integer fontSize;
         String color;
+        String highlight;  // Background color/highlighting
     }
 
     /**
@@ -172,6 +173,16 @@ public class DocxTemplateService {
             formatting.color = null;
         }
 
+        // Extract highlight/background color by copying the entire RPr XML
+        try {
+            if (run.getCTR() != null && run.getCTR().getRPr() != null) {
+                // Store the entire RPr XML structure as a string
+                formatting.highlight = run.getCTR().getRPr().xmlText();
+            }
+        } catch (Exception e) {
+            formatting.highlight = null;
+        }
+
         return formatting;
     }
 
@@ -211,6 +222,98 @@ public class DocxTemplateService {
         if (formatting.color != null) {
             target.setColor(formatting.color);
         }
+
+        // Apply highlight/background color by copying from source RPr XML
+        if (formatting.highlight != null && !formatting.highlight.isEmpty()) {
+            try {
+                // Extract highlight value from the stored RPr XML
+                String highlightValue = extractHighlightFromXml(formatting.highlight);
+                if (highlightValue != null) {
+                    // Ensure RPr exists on target
+                    if (target.getCTR().getRPr() == null) {
+                        target.getCTR().addNewRPr();
+                    }
+                    
+                    // Use XML cursor to add highlight element
+                    org.apache.xmlbeans.XmlCursor cursor = target.getCTR().getRPr().newCursor();
+                    // Move to end of RPr to insert highlight
+                    cursor.toEndToken();
+                    // Insert highlight element
+                    cursor.insertElement(
+                        "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+                        "highlight"
+                    );
+                    // Set the val attribute
+                    cursor.insertAttributeWithValue(
+                        "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+                        "val",
+                        highlightValue
+                    );
+                    cursor.dispose();
+                }
+            } catch (Exception e) {
+                // Try alternative approach using DOM directly
+                try {
+                    String highlightValue = extractHighlightFromXml(formatting.highlight);
+                    if (highlightValue != null && target.getCTR().getRPr() != null) {
+                        org.w3c.dom.Document doc = target.getCTR().getRPr().getDomNode().getOwnerDocument();
+                        org.w3c.dom.Element highlightElement = doc.createElementNS(
+                            "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+                            "w:highlight"
+                        );
+                        highlightElement.setAttributeNS(
+                            "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
+                            "w:val",
+                            highlightValue
+                        );
+                        target.getCTR().getRPr().getDomNode().appendChild(highlightElement);
+                    }
+                } catch (Exception ex) {
+                    // Ignore if highlight cannot be applied - document will still work
+                }
+            }
+        }
+    }
+    
+    /**
+     * Helper method to extract highlight value from RPr XML string
+     */
+    private String extractHighlightFromXml(String rprXml) {
+        if (rprXml == null || rprXml.isEmpty()) {
+            return null;
+        }
+        try {
+            // Look for highlight element - try with namespace prefix first
+            int highlightElementStart = rprXml.indexOf("<w:highlight");
+            if (highlightElementStart < 0) {
+                // Try without namespace prefix
+                highlightElementStart = rprXml.indexOf("<highlight");
+            }
+            
+            if (highlightElementStart >= 0) {
+                // Find the val attribute - try with namespace prefix first
+                int valStart = rprXml.indexOf("w:val=\"", highlightElementStart);
+                if (valStart < 0) {
+                    // Try without namespace prefix
+                    valStart = rprXml.indexOf("val=\"", highlightElementStart);
+                    if (valStart > 0) {
+                        valStart += 5; // Skip "val=\""
+                    }
+                } else {
+                    valStart += 7; // Skip "w:val=\""
+                }
+                
+                if (valStart > highlightElementStart) {
+                    int valEnd = rprXml.indexOf("\"", valStart);
+                    if (valEnd > valStart) {
+                        return rprXml.substring(valStart, valEnd);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Return null if extraction fails
+        }
+        return null;
     }
 }
 
