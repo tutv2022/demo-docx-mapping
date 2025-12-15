@@ -270,16 +270,19 @@ public class DocxTemplateService {
             loopContent.add(paragraphs.get(i));
         }
         
-        // Remove the loop markers
+        // IMPORTANT: Clone paragraph XML BEFORE removing them from document
+        // This prevents XmlValueDisconnectedException
+        List<String> loopContentXml = new ArrayList<>();
+        for (XWPFParagraph para : loopContent) {
+            // Get XML text while paragraph is still connected
+            String paraXml = para.getCTP().xmlText();
+            loopContentXml.add(paraXml);
+        }
+        
+        // Remove the loop markers from start and end paragraphs
         removePlaceholderFromParagraph(startPara, LOOP_START_PATTERN);
         XWPFParagraph endPara = paragraphs.get(endIndex);
         removePlaceholderFromParagraph(endPara, LOOP_END_PATTERN);
-        
-        // Find insertion point - get the body element position of startPara
-        int insertPosition = findInsertPosition(document, startPara);
-        if (insertPosition == -1) {
-            return;
-        }
         
         // Get the CTBody to manipulate XML directly
         org.openxmlformats.schemas.wordprocessingml.x2006.main.CTBody body = document.getDocument().getBody();
@@ -299,23 +302,47 @@ public class DocxTemplateService {
             return; // Couldn't find the paragraph
         }
         
+        // Remove the original loop content paragraphs and end marker BEFORE inserting new ones
+        // This avoids index shifting issues
+        // Remove from end to start to maintain correct indices
+        int endParaIndex = -1;
+        String endParaXml = endPara.getCTP().xmlText();
+        for (int i = 0; i < body.sizeOfPArray(); i++) {
+            if (body.getPArray(i).xmlText().equals(endParaXml)) {
+                endParaIndex = i;
+                break;
+            }
+        }
+        
+        if (endParaIndex == -1 || endParaIndex <= startParaIndex) {
+            // End marker not found or invalid - can't proceed safely
+            return;
+        }
+        
+        // Remove end marker paragraph first
+        body.removeP(endParaIndex);
+        // After removal, endParaIndex is now one less, but we don't need it anymore
+        
+        // Remove loop content paragraphs (between start and end, excluding start itself)
+        // Remove from end to start to avoid index shifting
+        // After removing endPara, the last content paragraph is at endParaIndex - 1
+        for (int i = endParaIndex - 1; i > startParaIndex; i--) {
+            body.removeP(i);
+        }
+        
         // Create and insert paragraphs for each item
         int currentInsertPos = startParaIndex + 1;
         
         for (Map<String, Object> item : items) {
-            // Process each paragraph in the loop content
-            for (XWPFParagraph originalPara : loopContent) {
-                // Clone the paragraph's CT element using XML text
-                org.openxmlformats.schemas.wordprocessingml.x2006.main.CTP originalParaCT = originalPara.getCTP();
-                String paraXml = originalParaCT.xmlText();
-                
-                // Parse the cloned XML to create a new CT element
+            // Process each paragraph XML in the loop content
+            for (String paraXml : loopContentXml) {
+                // Parse the XML to create a new CT element
                 org.openxmlformats.schemas.wordprocessingml.x2006.main.CTP clonedCT;
                 try {
                     clonedCT = org.openxmlformats.schemas.wordprocessingml.x2006.main.CTP.Factory.parse(paraXml);
                 } catch (org.apache.xmlbeans.XmlException e) {
-                    // Fallback to copy method
-                    clonedCT = (org.openxmlformats.schemas.wordprocessingml.x2006.main.CTP) originalParaCT.copy();
+                    // If parsing fails, skip this paragraph
+                    continue;
                 }
                 
                 // Insert new paragraph at position and replace it with our cloned content
@@ -330,7 +357,20 @@ public class DocxTemplateService {
                 XWPFParagraph newPara = new XWPFParagraph(newParaCT, document);
                 
                 // Process placeholders with item data
-                processAllPlaceholders(newPara, item);
+                // This must work correctly - if paragraph has no runs, it means it's empty and we skip it
+                if (!newPara.getRuns().isEmpty()) {
+                    processAllPlaceholders(newPara, item);
+                } else {
+                    // If no runs, check if there's text in the CT element that needs processing
+                    String paraText = getParagraphText(newPara);
+                    if (paraText != null && !paraText.trim().isEmpty()) {
+                        // There's text but no runs - this shouldn't happen with a cloned paragraph
+                        // But if it does, create a run and process it
+                        XWPFRun run = newPara.createRun();
+                        run.setText(paraText);
+                        processAllPlaceholders(newPara, item);
+                    }
+                }
                 
                 // Move insertion position forward
                 currentInsertPos++;
