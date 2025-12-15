@@ -13,6 +13,7 @@ public class DocxTemplateService {
 
     private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\$\\{([^}]+)\\}");
     private static final Pattern CHECKBOX_PATTERN = Pattern.compile("\\$\\{checkbox:([^:]+):([^}]+)\\}");
+    private static final Pattern RADIO_PATTERN = Pattern.compile("\\$\\{radio:([^:]+):([^}]+)\\}");
     // Loop patterns - escape # and . properly
     private static final Pattern LOOP_START_PATTERN = Pattern.compile("\\$\\{#loop\\.([^}]+)\\}");
     private static final Pattern LOOP_END_PATTERN = Pattern.compile("\\$\\{#loop\\}");
@@ -470,7 +471,7 @@ public class DocxTemplateService {
     }
 
     /**
-     * Processes both checkbox and regular placeholders in a single pass
+     * Processes radio buttons, checkboxes, and regular placeholders in a single pass
      * This prevents duplication and ensures proper replacement
      */
     private void processAllPlaceholders(XWPFParagraph paragraph, Map<String, Object> data) {
@@ -478,31 +479,54 @@ public class DocxTemplateService {
             return;
         }
 
-        // Collect all text from runs
-        StringBuilder fullText = new StringBuilder();
-        for (XWPFRun run : paragraph.getRuns()) {
-            String runText = run.getText(0);
-            if (runText != null) {
-                fullText.append(runText);
-            }
-        }
-
-        String paragraphText = fullText.toString();
+        // Collect all text from runs using safe method
+        String paragraphText = getParagraphText(paragraph);
         
         // Check if paragraph has any placeholders
+        Matcher radioMatcher = RADIO_PATTERN.matcher(paragraphText);
         Matcher checkboxMatcher = CHECKBOX_PATTERN.matcher(paragraphText);
         Matcher regularMatcher = PLACEHOLDER_PATTERN.matcher(paragraphText);
         
+        boolean hasRadios = radioMatcher.find();
         boolean hasCheckboxes = checkboxMatcher.find();
         boolean hasRegularPlaceholders = regularMatcher.find();
         
-        if (!hasCheckboxes && !hasRegularPlaceholders) {
+        if (!hasRadios && !hasCheckboxes && !hasRegularPlaceholders) {
             return; // No placeholders in this paragraph
         }
 
         String replacedText = paragraphText;
 
-        // Step 1: Process checkbox placeholders first
+        // Step 1: Process radio button placeholders first
+        if (hasRadios) {
+            radioMatcher.reset();
+            Map<String, String> radioReplacements = new HashMap<>();
+            
+            while (radioMatcher.find()) {
+                String radioGroup = radioMatcher.group(1); // e.g., "gender"
+                String radioValue = radioMatcher.group(2); // e.g., "male" or "female"
+                String fullPlaceholder = radioMatcher.group(0); // e.g., "${radio:gender:male}"
+                
+                // Get the actual value for this group from data
+                Object groupValueObj = data.get(radioGroup);
+                String groupValue = groupValueObj != null ? groupValueObj.toString() : null;
+                
+                // Determine if this radio button should be selected
+                boolean isSelected = radioValue.equalsIgnoreCase(groupValue);
+                
+                // Replace with radio button symbol (● = checked, ○ = unchecked)
+                //String radioSymbol = isSelected ? "● " : "○ ";
+                String radioSymbol = isSelected ? "◉" : "○";
+                radioReplacements.put(fullPlaceholder, radioSymbol);
+            }
+            
+            // Apply radio button replacements
+            for (Map.Entry<String, String> entry : radioReplacements.entrySet()) {
+                replacedText = replacedText.replace(entry.getKey(), entry.getValue());
+            }
+        }
+
+        // Step 2: Process checkbox placeholders
         if (hasCheckboxes) {
             checkboxMatcher.reset();
             Map<String, String> checkboxReplacements = new HashMap<>();
@@ -519,12 +543,7 @@ public class DocxTemplateService {
                 // Determine if this checkbox should be checked
                 boolean isChecked = checkboxValue.equalsIgnoreCase(groupValue);
                 
-                // Replace with checkbox symbol followed by a space for better formatting
-//                String checkboxSymbol = isChecked ? "☑ " : "☐ ";
-//                String checkboxSymbol = isChecked ? "☒ " : "☐ ";
-//                String checkboxSymbol = isChecked ? "☑ " : "☐ ";
-                // Wingdings: ☐ = 0x6F, ☑ = 0xFE
-//                String checkboxSymbol = isChecked ? "\u00FE " : "\u006F ";
+                // Replace with checkbox symbol
                 String checkboxSymbol = isChecked ? "☒" : "☐";
                 checkboxReplacements.put(fullPlaceholder, checkboxSymbol);
             }
@@ -535,7 +554,7 @@ public class DocxTemplateService {
             }
         }
 
-        // Step 2: Process regular placeholders
+        // Step 3: Process regular placeholders
         if (hasRegularPlaceholders) {
             for (Map.Entry<String, Object> entry : data.entrySet()) {
                 String placeholder = "${" + entry.getKey() + "}";
