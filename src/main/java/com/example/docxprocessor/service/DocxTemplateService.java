@@ -27,14 +27,9 @@ public class DocxTemplateService {
     public byte[] processTemplatePreservingFormat(InputStream templateInputStream, Map<String, String> data) throws IOException {
         try (XWPFDocument document = new XWPFDocument(templateInputStream)) {
             
-            // Step 1: Process checkbox placeholders first (before regular placeholders)
+            // Process paragraphs - unified processing for checkboxes and regular placeholders
             for (XWPFParagraph paragraph : document.getParagraphs()) {
-                processCheckboxPlaceholders(paragraph, data);
-            }
-            
-            // Step 2: Process regular placeholders (existing code)
-            for (XWPFParagraph paragraph : document.getParagraphs()) {
-                replaceInParagraphPreservingFormat(paragraph, data);
+                processAllPlaceholders(paragraph, data);
             }
 
             // Process tables
@@ -42,8 +37,7 @@ public class DocxTemplateService {
                 for (XWPFTableRow row : table.getRows()) {
                     for (XWPFTableCell cell : row.getTableCells()) {
                         for (XWPFParagraph paragraph : cell.getParagraphs()) {
-                            processCheckboxPlaceholders(paragraph, data);
-                            replaceInParagraphPreservingFormat(paragraph, data);
+                            processAllPlaceholders(paragraph, data);
                         }
                     }
                 }
@@ -52,22 +46,111 @@ public class DocxTemplateService {
             // Process headers
             for (XWPFHeader header : document.getHeaderList()) {
                 for (XWPFParagraph paragraph : header.getParagraphs()) {
-                    processCheckboxPlaceholders(paragraph, data);
-                    replaceInParagraphPreservingFormat(paragraph, data);
+                    processAllPlaceholders(paragraph, data);
                 }
             }
 
             // Process footers
             for (XWPFFooter footer : document.getFooterList()) {
                 for (XWPFParagraph paragraph : footer.getParagraphs()) {
-                    processCheckboxPlaceholders(paragraph, data);
-                    replaceInParagraphPreservingFormat(paragraph, data);
+                    processAllPlaceholders(paragraph, data);
                 }
             }
 
             ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
             document.write(outputStream);
             return outputStream.toByteArray();
+        }
+    }
+
+    /**
+     * Processes both checkbox and regular placeholders in a single pass
+     * This prevents duplication and ensures proper replacement
+     */
+    private void processAllPlaceholders(XWPFParagraph paragraph, Map<String, String> data) {
+        if (paragraph.getRuns().isEmpty()) {
+            return;
+        }
+
+        // Collect all text from runs
+        StringBuilder fullText = new StringBuilder();
+        for (XWPFRun run : paragraph.getRuns()) {
+            String runText = run.getText(0);
+            if (runText != null) {
+                fullText.append(runText);
+            }
+        }
+
+        String paragraphText = fullText.toString();
+        
+        // Check if paragraph has any placeholders
+        Matcher checkboxMatcher = CHECKBOX_PATTERN.matcher(paragraphText);
+        Matcher regularMatcher = PLACEHOLDER_PATTERN.matcher(paragraphText);
+        
+        boolean hasCheckboxes = checkboxMatcher.find();
+        boolean hasRegularPlaceholders = regularMatcher.find();
+        
+        if (!hasCheckboxes && !hasRegularPlaceholders) {
+            return; // No placeholders in this paragraph
+        }
+
+        String replacedText = paragraphText;
+
+        // Step 1: Process checkbox placeholders first
+        if (hasCheckboxes) {
+            checkboxMatcher.reset();
+            Map<String, String> checkboxReplacements = new HashMap<>();
+            
+            while (checkboxMatcher.find()) {
+                String checkboxGroup = checkboxMatcher.group(1); // e.g., "gender"
+                String checkboxValue = checkboxMatcher.group(2); // e.g., "male" or "female"
+                String fullPlaceholder = checkboxMatcher.group(0); // e.g., "${checkbox:gender:male}"
+                
+                // Get the actual value for this group from data
+                String groupValue = data.get(checkboxGroup); // e.g., data.get("gender") -> "male"
+                
+                // Determine if this checkbox should be checked
+                boolean isChecked = checkboxValue.equalsIgnoreCase(groupValue);
+                
+                // Replace with checkbox symbol followed by a space for better formatting
+//                String checkboxSymbol = isChecked ? "☑ " : "☐ ";
+//                String checkboxSymbol = isChecked ? "☒ " : "☐ ";
+//                String checkboxSymbol = isChecked ? "☑ " : "☐ ";
+                // Wingdings: ☐ = 0x6F, ☑ = 0xFE
+//                String checkboxSymbol = isChecked ? "\u00FE " : "\u006F ";
+                String checkboxSymbol = isChecked ? "☒" : "☐";
+                checkboxReplacements.put(fullPlaceholder, checkboxSymbol);
+            }
+            
+            // Apply checkbox replacements
+            for (Map.Entry<String, String> entry : checkboxReplacements.entrySet()) {
+                replacedText = replacedText.replace(entry.getKey(), entry.getValue());
+            }
+        }
+
+        // Step 2: Process regular placeholders
+        if (hasRegularPlaceholders) {
+            for (Map.Entry<String, String> entry : data.entrySet()) {
+                String placeholder = "${" + entry.getKey() + "}";
+                replacedText = replacedText.replace(placeholder, entry.getValue() != null ? entry.getValue() : "");
+            }
+        }
+
+        // Only update if text changed
+        if (!replacedText.equals(paragraphText)) {
+            // Extract formatting before removing runs
+            RunFormatting formatting = extractRunFormatting(paragraph.getRuns().get(0));
+            
+            // Clear all runs
+            int runsCount = paragraph.getRuns().size();
+            for (int i = runsCount - 1; i >= 0; i--) {
+                paragraph.removeRun(i);
+            }
+            
+            // Create new run with replaced text
+            XWPFRun newRun = paragraph.createRun();
+            newRun.setText(replacedText);
+            applyRunFormatting(formatting, newRun);
         }
     }
 
@@ -112,8 +195,11 @@ public class DocxTemplateService {
             // Determine if this checkbox should be checked
             boolean isChecked = checkboxValue.equalsIgnoreCase(groupValue);
             
-            // Replace with checkbox symbol
-            String checkboxSymbol = isChecked ? "☑" : "☐";
+            // Replace with checkbox symbol followed by a space for better formatting
+//            String checkboxSymbol = isChecked ? "☑ " : "☐ ";
+//            String checkboxSymbol = isChecked ? "V" : "x";
+            // Wingdings: ☐ = 0x6F, ☑ = 0xFE
+            String checkboxSymbol = isChecked ? "\u00FE " : "\u006F ";
             checkboxReplacements.put(fullPlaceholder, checkboxSymbol);
         }
 
