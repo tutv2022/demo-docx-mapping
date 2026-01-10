@@ -11,12 +11,15 @@ import java.util.regex.Pattern;
 @Service
 public class DocxTemplateService {
 
-    private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\$\\{([^}]+)\\}");
-    private static final Pattern CHECKBOX_PATTERN = Pattern.compile("\\$\\{checkbox:([^:]+):([^}]+)\\}");
-    private static final Pattern RADIO_PATTERN = Pattern.compile("\\$\\{radio:([^:]+):([^}]+)\\}");
-    // Loop patterns - escape # and . properly
-    private static final Pattern LOOP_START_PATTERN = Pattern.compile("\\$\\{#loop\\.([^}]+)\\}");
-    private static final Pattern LOOP_END_PATTERN = Pattern.compile("\\$\\{#loop\\}");
+    // New syntax patterns: {{$json.variable}}, {{#loop:$json.array}}, {{#/loop}}, etc.
+    private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\{\\{\\$json\\.([^}]+)\\}\\}");
+    private static final Pattern CHECKBOX_PATTERN = Pattern.compile("\\{\\{checkbox:\\s*\\$json\\.([^:]+):([^}]+)\\}\\}");
+    private static final Pattern RADIO_PATTERN = Pattern.compile("\\{\\{radio:\\s*\\$json\\.([^:]+):([^}]+)\\}\\}");
+    // Loop patterns - new syntax: {{#loop:$json.arrayName}} and {{#/loop}}
+    private static final Pattern LOOP_START_PATTERN = Pattern.compile("\\{\\{#loop:\\s*\\$json\\.([^}]+)\\}\\}");
+    private static final Pattern LOOP_END_PATTERN = Pattern.compile("\\{\\{#/loop\\}\\}");
+    // Pattern for loop item access: {{$json.arrayName[i].property}}
+    private static final Pattern LOOP_ITEM_PATTERN = Pattern.compile("\\{\\{\\$json\\.([^\\[]+)\\[i\\]\\.([^}]+)\\}\\}");
 
     /**
      * Processes a DOCX template file by replacing placeholders with actual values
@@ -70,8 +73,25 @@ public class DocxTemplateService {
     }
 
     /**
+     * Helper method to extract variable name from $json.variableName format
+     * @param jsonPath The path like "$json.customerName" or "customerName"
+     * @return The variable name without $json. prefix
+     */
+    private String extractVariableName(String jsonPath) {
+        if (jsonPath == null) {
+            return null;
+        }
+        // Remove $json. prefix if present
+        if (jsonPath.startsWith("$json.")) {
+            return jsonPath.substring(6); // Length of "$json."
+        }
+        return jsonPath;
+    }
+
+    /**
      * Processes loop blocks in the document
-     * Syntax: ${#loop.variableName} ... content ... ${#loop}
+     * New syntax: {{#loop:$json.arrayName}} ... content ... {{#/loop}}
+     * Within loops, use {{$json.arrayName[i].property}} to access item properties
      */
     private void processLoops(XWPFDocument document, Map<String, Object> data) {
         List<XWPFParagraph> paragraphs = new ArrayList<>(document.getParagraphs());
@@ -247,7 +267,8 @@ public class DocxTemplateService {
             return;
         }
         
-        String loopVariable = startMatcher.group(1); // e.g., "orderItems"
+        String loopVariablePath = startMatcher.group(1); // e.g., "orderItems" (already extracted from $json.orderItems)
+        String loopVariable = extractVariableName(loopVariablePath);
         
         // Get the list from data
         Object listObj = data.get(loopVariable);
@@ -356,10 +377,10 @@ public class DocxTemplateService {
                 // Create XWPFParagraph wrapper to process placeholders
                 XWPFParagraph newPara = new XWPFParagraph(newParaCT, document);
                 
-                // Process placeholders with item data
+                // Process placeholders with item data and loop context
                 // This must work correctly - if paragraph has no runs, it means it's empty and we skip it
                 if (!newPara.getRuns().isEmpty()) {
-                    processAllPlaceholders(newPara, item);
+                    processAllPlaceholders(newPara, item, loopVariable);
                 } else {
                     // If no runs, check if there's text in the CT element that needs processing
                     String paraText = getParagraphText(newPara);
@@ -368,7 +389,7 @@ public class DocxTemplateService {
                         // But if it does, create a run and process it
                         XWPFRun run = newPara.createRun();
                         run.setText(paraText);
-                        processAllPlaceholders(newPara, item);
+                        processAllPlaceholders(newPara, item, loopVariable);
                     }
                 }
                 
@@ -513,8 +534,13 @@ public class DocxTemplateService {
     /**
      * Processes radio buttons, checkboxes, and regular placeholders in a single pass
      * This prevents duplication and ensures proper replacement
+     * New syntax: {{$json.variable}}, {{checkbox:$json.var:value}}, {{radio:$json.var:value}}
+     * 
+     * @param paragraph The paragraph to process
+     * @param data The data map
+     * @param loopArrayName Optional loop array name for handling [i] syntax (null if not in loop)
      */
-    private void processAllPlaceholders(XWPFParagraph paragraph, Map<String, Object> data) {
+    private void processAllPlaceholders(XWPFParagraph paragraph, Map<String, Object> data, String loopArrayName) {
         if (paragraph.getRuns().isEmpty()) {
             return;
         }
@@ -526,26 +552,56 @@ public class DocxTemplateService {
         Matcher radioMatcher = RADIO_PATTERN.matcher(paragraphText);
         Matcher checkboxMatcher = CHECKBOX_PATTERN.matcher(paragraphText);
         Matcher regularMatcher = PLACEHOLDER_PATTERN.matcher(paragraphText);
+        Matcher loopItemMatcher = LOOP_ITEM_PATTERN.matcher(paragraphText);
         
         boolean hasRadios = radioMatcher.find();
         boolean hasCheckboxes = checkboxMatcher.find();
         boolean hasRegularPlaceholders = regularMatcher.find();
+        boolean hasLoopItems = loopItemMatcher.find();
         
-        if (!hasRadios && !hasCheckboxes && !hasRegularPlaceholders) {
+        if (!hasRadios && !hasCheckboxes && !hasRegularPlaceholders && !hasLoopItems) {
             return; // No placeholders in this paragraph
         }
 
         String replacedText = paragraphText;
 
-        // Step 1: Process radio button placeholders first
+        // Step 1: Process loop item placeholders first ({{$json.arrayName[i].property}})
+        if (hasLoopItems && loopArrayName != null) {
+            loopItemMatcher.reset();
+            Map<String, String> loopItemReplacements = new HashMap<>();
+            
+            while (loopItemMatcher.find()) {
+                String arrayName = loopItemMatcher.group(1); // e.g., "orderItems"
+                String property = loopItemMatcher.group(2); // e.g., "itemName"
+                String fullPlaceholder = loopItemMatcher.group(0); // e.g., "{{$json.orderItems[i].itemName}}"
+                
+                // Only process if this matches the current loop array
+                if (arrayName.equals(loopArrayName)) {
+                    // Get the property value from current item data
+                    Object propertyValue = data.get(property);
+                    String value = propertyValue != null ? propertyValue.toString() : "";
+                    loopItemReplacements.put(fullPlaceholder, value);
+                }
+            }
+            
+            // Apply loop item replacements
+            for (Map.Entry<String, String> entry : loopItemReplacements.entrySet()) {
+                replacedText = replacedText.replace(entry.getKey(), entry.getValue());
+            }
+        }
+
+        // Step 2: Process radio button placeholders
         if (hasRadios) {
             radioMatcher.reset();
             Map<String, String> radioReplacements = new HashMap<>();
             
             while (radioMatcher.find()) {
-                String radioGroup = radioMatcher.group(1); // e.g., "gender"
+                String radioGroupPath = radioMatcher.group(1); // e.g., "gender" (from $json.gender)
                 String radioValue = radioMatcher.group(2); // e.g., "male" or "female"
-                String fullPlaceholder = radioMatcher.group(0); // e.g., "${radio:gender:male}"
+                String fullPlaceholder = radioMatcher.group(0); // e.g., "{{radio:$json.gender:male}}"
+                
+                // Extract variable name from $json.variableName format
+                String radioGroup = extractVariableName(radioGroupPath);
                 
                 // Get the actual value for this group from data
                 Object groupValueObj = data.get(radioGroup);
@@ -554,8 +610,7 @@ public class DocxTemplateService {
                 // Determine if this radio button should be selected
                 boolean isSelected = radioValue.equalsIgnoreCase(groupValue);
                 
-                // Replace with radio button symbol (● = checked, ○ = unchecked)
-                //String radioSymbol = isSelected ? "● " : "○ ";
+                // Replace with radio button symbol
                 String radioSymbol = isSelected ? "◉" : "○";
                 radioReplacements.put(fullPlaceholder, radioSymbol);
             }
@@ -566,15 +621,18 @@ public class DocxTemplateService {
             }
         }
 
-        // Step 2: Process checkbox placeholders
+        // Step 3: Process checkbox placeholders
         if (hasCheckboxes) {
             checkboxMatcher.reset();
             Map<String, String> checkboxReplacements = new HashMap<>();
             
             while (checkboxMatcher.find()) {
-                String checkboxGroup = checkboxMatcher.group(1); // e.g., "gender"
+                String checkboxGroupPath = checkboxMatcher.group(1); // e.g., "gender" (from $json.gender)
                 String checkboxValue = checkboxMatcher.group(2); // e.g., "male" or "female"
-                String fullPlaceholder = checkboxMatcher.group(0); // e.g., "${checkbox:gender:male}"
+                String fullPlaceholder = checkboxMatcher.group(0); // e.g., "{{checkbox:$json.gender:male}}"
+                
+                // Extract variable name from $json.variableName format
+                String checkboxGroup = extractVariableName(checkboxGroupPath);
                 
                 // Get the actual value for this group from data
                 Object groupValueObj = data.get(checkboxGroup);
@@ -594,12 +652,27 @@ public class DocxTemplateService {
             }
         }
 
-        // Step 3: Process regular placeholders
+        // Step 4: Process regular placeholders ({{$json.variableName}})
         if (hasRegularPlaceholders) {
-            for (Map.Entry<String, Object> entry : data.entrySet()) {
-                String placeholder = "${" + entry.getKey() + "}";
-                String value = entry.getValue() != null ? entry.getValue().toString() : "";
-                replacedText = replacedText.replace(placeholder, value);
+            regularMatcher.reset();
+            Map<String, String> placeholderReplacements = new HashMap<>();
+            
+            while (regularMatcher.find()) {
+                String variablePath = regularMatcher.group(1); // e.g., "customerName" from $json.customerName
+                String fullPlaceholder = regularMatcher.group(0); // e.g., "{{$json.customerName}}"
+                
+                // Extract variable name from $json.variableName format
+                String variableName = extractVariableName(variablePath);
+                
+                // Get value from data
+                Object valueObj = data.get(variableName);
+                String value = valueObj != null ? valueObj.toString() : "";
+                placeholderReplacements.put(fullPlaceholder, value);
+            }
+            
+            // Apply regular placeholder replacements
+            for (Map.Entry<String, String> entry : placeholderReplacements.entrySet()) {
+                replacedText = replacedText.replace(entry.getKey(), entry.getValue());
             }
         }
 
@@ -619,6 +692,13 @@ public class DocxTemplateService {
             newRun.setText(replacedText);
             applyRunFormatting(formatting, newRun);
         }
+    }
+
+    /**
+     * Overloaded method for backward compatibility (non-loop context)
+     */
+    private void processAllPlaceholders(XWPFParagraph paragraph, Map<String, Object> data) {
+        processAllPlaceholders(paragraph, data, null);
     }
 
     /**
