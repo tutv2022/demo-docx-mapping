@@ -11,16 +11,17 @@ import java.util.regex.Pattern;
 @Service
 public class DocxTemplateService {
 
-    // New syntax patterns: {{$json.variable}}, {{#loop:$json.array}}, {{#/loop}}, etc.
-    private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\{\\{\\$json\\.([^}]+)\\}\\}");
-    private static final Pattern CHECKBOX_PATTERN = Pattern.compile("\\{\\{checkbox:\\s*\\$json\\.([^:]+):([^}]+)\\}\\}");
-    private static final Pattern RADIO_PATTERN = Pattern.compile("\\{\\{radio:\\s*\\$json\\.([^:]+):([^}]+)\\}\\}");
-    // Loop patterns - new syntax: {{#loop:$json.arrayName}} and {{#/loop}}
-    private static final Pattern LOOP_START_PATTERN = Pattern.compile("\\{\\{#loop:\\s*\\$json\\.([^}]+)\\}\\}");
+    // New syntax patterns: {{$variable}}, {{#loop:$array}}, {{#/loop}}, etc. (keeps $ but removed json.)
+    private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\{\\{\\$([^}]+)\\}\\}");
+    private static final Pattern CHECKBOX_PATTERN = Pattern.compile("\\{\\{#checkbox:\\s*\\$([^:]+):([^}]+)\\}\\}");
+    private static final Pattern RADIO_PATTERN = Pattern.compile("\\{\\{#radio:\\s*\\$([^:]+):([^}]+)\\}\\}");
+    // Loop patterns - new syntax: {{#loop:$arrayName}} and {{#/loop}}
+    private static final Pattern LOOP_START_PATTERN = Pattern.compile("\\{\\{#loop:\\s*\\$([^}]+)\\}\\}");
     private static final Pattern LOOP_END_PATTERN = Pattern.compile("\\{\\{#/loop\\}\\}");
-    // Pattern for loop item access: {{$json.arrayName[i].property}}
+    // Pattern for loop item access: {{$arrayName[i].property}} or {{$arrayName[1].property}}
+    // Supports both [i] (current index) and [number] (specific index)
     // Allows optional whitespace and handles various property names
-    private static final Pattern LOOP_ITEM_PATTERN = Pattern.compile("\\{\\{\\s*\\$json\\.([^\\[\\}]+)\\[i\\]\\.([^\\}]+)\\s*\\}\\}");
+    private static final Pattern LOOP_ITEM_PATTERN = Pattern.compile("\\{\\{\\s*\\$([^\\[\\}]+)\\[([^\\]]+)\\]\\.([^\\}]+)\\s*\\}\\}");
 
     /**
      * Processes a DOCX template file by replacing placeholders with actual values
@@ -74,25 +75,26 @@ public class DocxTemplateService {
     }
 
     /**
-     * Helper method to extract variable name from $json.variableName format
-     * @param jsonPath The path like "$json.customerName" or "customerName"
-     * @return The variable name without $json. prefix
+     * Helper method to extract variable name from $variableName format
+     * @param variablePath The variable path like "$customerName" or "$orderItems"
+     * @return The variable name without $ prefix
      */
-    private String extractVariableName(String jsonPath) {
-        if (jsonPath == null) {
+    private String extractVariableName(String variablePath) {
+        if (variablePath == null) {
             return null;
         }
-        // Remove $json. prefix if present
-        if (jsonPath.startsWith("$json.")) {
-            return jsonPath.substring(6); // Length of "$json."
+        // Remove $ prefix if present
+        String trimmed = variablePath.trim();
+        if (trimmed.startsWith("$")) {
+            return trimmed.substring(1);
         }
-        return jsonPath;
+        return trimmed;
     }
 
     /**
      * Processes loop blocks in the document
-     * New syntax: {{#loop:$json.arrayName}} ... content ... {{#/loop}}
-     * Within loops, use {{$json.arrayName[i].property}} to access item properties
+     * New syntax: {{#loop:$arrayName}} ... content ... {{#/loop}}
+     * Within loops, use {{$arrayName[i].property}} to access item properties
      */
     private void processLoops(XWPFDocument document, Map<String, Object> data) {
         List<XWPFParagraph> paragraphs = new ArrayList<>(document.getParagraphs());
@@ -268,7 +270,7 @@ public class DocxTemplateService {
             return;
         }
         
-        String loopVariablePath = startMatcher.group(1); // e.g., "orderItems" (already extracted from $json.orderItems)
+        String loopVariablePath = startMatcher.group(1); // e.g., "orderItems"
         String loopVariable = extractVariableName(loopVariablePath);
         
         // Get the list from data
@@ -539,7 +541,7 @@ public class DocxTemplateService {
     /**
      * Processes radio buttons, checkboxes, and regular placeholders while preserving formatting
      * only for the placeholder variables themselves, not the entire paragraph.
-     * New syntax: {{$json.variable}}, {{checkbox:$json.var:value}}, {{radio:$json.var:value}}
+     * New syntax: {{$variable}}, {{#checkbox:$var:value}}, {{#radio:$var:value}}
      * 
      * @param paragraph The paragraph to process
      * @param data The data map (current item when in loop, or full data when not in loop)
@@ -574,83 +576,84 @@ public class DocxTemplateService {
         // Build replacement map for all placeholders
         Map<String, String> allReplacements = new HashMap<>();
 
-        // Step 1: Build replacement map for loop item placeholders ({{$json.arrayName[i].property}})
-        // Replace [i] with actual index and extract value from original data structure
-        if (hasLoopItems && loopArrayName != null && currentIndex >= 0 && originalData != null) {
+        // Step 1: Build replacement map for loop item placeholders ({{$arrayName[i].property}} or {{$arrayName[1].property}})
+        // Supports both [i] (current index) and [number] (specific index)
+        if (hasLoopItems && originalData != null) {
             loopItemMatcher.reset();
             while (loopItemMatcher.find()) {
                 String arrayName = loopItemMatcher.group(1).trim();
-                String property = loopItemMatcher.group(2).trim();
-                String fullPlaceholder = loopItemMatcher.group(0); // e.g., {{$json.orderItems[i].unitPrice}}
+                String indexStr = loopItemMatcher.group(2).trim(); // Can be "i" or a number like "1", "2", etc.
+                String property = loopItemMatcher.group(3).trim();
+                String fullPlaceholder = loopItemMatcher.group(0); // e.g., {{$orderItems[i].unitPrice}} or {{$orderItems[1].itemSKU}}
                 
-                // Debug output - uncomment to see what's happening
-                // System.out.println("DEBUG Loop Item: placeholder=" + fullPlaceholder + ", arrayName=" + arrayName + ", property=" + property + ", loopArrayName=" + loopArrayName + ", currentIndex=" + currentIndex);
-                
-                if (arrayName.equals(loopArrayName)) {
-                    // Extract value from original data structure using the path: orderItems[index].property
-                    // For each iteration, we access: originalData.get("orderItems").get(currentIndex).get("property")
-                    Object propertyValue = null;
-                    
-                    // Get the list from original data
-                    Object listObj = originalData.get(arrayName);
-                    if (listObj == null) {
-                        // Debug: list not found
-                        // System.out.println("DEBUG: List '" + arrayName + "' not found in originalData. Available keys: " + originalData.keySet());
-                    } else if (!(listObj instanceof List)) {
-                        // Debug: not a list
-                        // System.out.println("DEBUG: '" + arrayName + "' is not a List, it's: " + listObj.getClass().getName());
+                // Determine which index to use
+                int targetIndex = -1;
+                if (indexStr.equalsIgnoreCase("i")) {
+                    // Use current loop index
+                    if (loopArrayName != null && arrayName.equals(loopArrayName) && currentIndex >= 0) {
+                        targetIndex = currentIndex;
                     } else {
-                        @SuppressWarnings("unchecked")
-                        List<Object> items = (List<Object>) listObj;
+                        // Not in a loop context or array name doesn't match, skip this placeholder
+                        continue;
+                    }
+                } else {
+                    // Try to parse as a number (specific index)
+                    try {
+                        targetIndex = Integer.parseInt(indexStr);
+                    } catch (NumberFormatException e) {
+                        // Invalid index, skip this placeholder
+                        continue;
+                    }
+                }
+                
+                // Extract value from original data structure using the path: arrayName[index].property
+                Object propertyValue = null;
+                
+                // Get the list from original data
+                Object listObj = originalData.get(arrayName);
+                if (listObj == null) {
+                    // List not found, skip
+                    continue;
+                } else if (!(listObj instanceof List)) {
+                    // Not a list, skip
+                    continue;
+                } else {
+                    @SuppressWarnings("unchecked")
+                    List<Object> items = (List<Object>) listObj;
+                    
+                    if (targetIndex < 0 || targetIndex >= items.size()) {
+                        // Index out of bounds, use empty value
+                        propertyValue = null;
+                    } else {
+                        Object itemObj = items.get(targetIndex);
                         
-                        if (currentIndex >= items.size()) {
-                            // Debug: index out of bounds
-                            // System.out.println("DEBUG: Index " + currentIndex + " is out of bounds. List size: " + items.size());
+                        if (itemObj == null) {
+                            propertyValue = null;
+                        } else if (!(itemObj instanceof Map)) {
+                            propertyValue = null;
                         } else {
-                            Object itemObj = items.get(currentIndex);
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> item = (Map<String, Object>) itemObj;
                             
-                            if (itemObj == null) {
-                                // Debug: null item
-                                // System.out.println("DEBUG: Item at index " + currentIndex + " is null");
-                            } else if (!(itemObj instanceof Map)) {
-                                // Debug: not a map
-                                // System.out.println("DEBUG: Item at index " + currentIndex + " is not a Map, it's: " + itemObj.getClass().getName());
+                            // Try exact match first
+                            if (item.containsKey(property)) {
+                                propertyValue = item.get(property);
                             } else {
-                                @SuppressWarnings("unchecked")
-                                Map<String, Object> item = (Map<String, Object>) itemObj;
-                                
-                                // Debug: show available keys
-                                // System.out.println("DEBUG: Item keys: " + item.keySet() + ", looking for: " + property);
-                                
-                                // Try exact match first
-                                if (item.containsKey(property)) {
-                                    propertyValue = item.get(property);
-                                } else {
-                                    // Try case-insensitive lookup
-                                    for (Map.Entry<String, Object> entry : item.entrySet()) {
-                                        if (entry.getKey().equalsIgnoreCase(property)) {
-                                            propertyValue = entry.getValue();
-                                            break;
-                                        }
+                                // Try case-insensitive lookup
+                                for (Map.Entry<String, Object> entry : item.entrySet()) {
+                                    if (entry.getKey().equalsIgnoreCase(property)) {
+                                        propertyValue = entry.getValue();
+                                        break;
                                     }
                                 }
-                                
-                                // Debug: show result
-                                // System.out.println("DEBUG: Property '" + property + "' value: " + propertyValue);
                             }
                         }
                     }
-                    
-                    String value = propertyValue != null ? propertyValue.toString() : "";
-                    // Use the original placeholder (with [i]) as the key for replacement
-                    allReplacements.put(fullPlaceholder, value);
-                    
-                    // Debug: show replacement - UNCOMMENT TO DEBUG
-                    System.out.println("DEBUG: Adding replacement: " + fullPlaceholder + " -> " + value + " (index=" + currentIndex + ")");
-                } else {
-                    // Debug: array name mismatch
-                    System.out.println("DEBUG: Array name mismatch - placeholder: " + arrayName + ", loopArrayName: " + loopArrayName);
                 }
+                
+                String value = propertyValue != null ? propertyValue.toString() : "";
+                // Use the original placeholder as the key for replacement
+                allReplacements.put(fullPlaceholder, value);
             }
         }
         
@@ -695,18 +698,18 @@ public class DocxTemplateService {
             }
         }
 
-        // Step 4: Build replacement map for regular placeholders ({{$json.variableName}})
+        // Step 4: Build replacement map for regular placeholders ({{$variableName}})
         // IMPORTANT: Skip placeholders that were already processed in Step 1 (loop items)
-        // Loop item placeholders like {{$json.orderItems[i].property}} should not be processed here
+        // Loop item placeholders like {{$orderItems[i].property}} or {{$orderItems[1].property}} should not be processed here
         if (hasRegularPlaceholders) {
             regularMatcher.reset();
             while (regularMatcher.find()) {
                 String variablePath = regularMatcher.group(1);
                 String fullPlaceholder = regularMatcher.group(0);
 
-                // Skip if this placeholder contains [i] - it's a loop item placeholder
+                // Skip if this placeholder contains [i] or [number] - it's a loop item placeholder
                 // Loop item placeholders are already processed in Step 1
-                if (fullPlaceholder.contains("[i]")) {
+                if (fullPlaceholder.matches(".*\\[([i]|\\d+)\\].*")) {
                     continue;
                 }
                 
@@ -754,23 +757,25 @@ public class DocxTemplateService {
         
         // First, find all loop item placeholders in the text using pattern matching
         // This ensures we catch them even if whitespace differs
+        // Supports both [i] and [number] syntax
         Matcher loopItemMatcher = LOOP_ITEM_PATTERN.matcher(fullText);
         Map<String, String> loopItemMatches = new HashMap<>(); // Map from matched text to replacement value
         while (loopItemMatcher.find()) {
             String matchedText = loopItemMatcher.group(0);
             String arrayName = loopItemMatcher.group(1).trim();
-            String property = loopItemMatcher.group(2).trim();
+            String indexStr = loopItemMatcher.group(2).trim(); // Can be "i" or a number
+            String property = loopItemMatcher.group(3).trim();
             
-            // Build the key that should be in replacements map
-            String placeholderKey = "{{$json." + arrayName + "[i]." + property + "}}";
+            // Build the key that should be in replacements map (with the actual index from match)
+            String placeholderKey = "{{$" + arrayName + "[" + indexStr + "]." + property + "}}";
             
-            // Find matching replacement (try exact match, then normalized)
+            // Find matching replacement (try exact match first)
             String replacementValue = replacements.get(placeholderKey);
             if (replacementValue == null) {
-                // Try to find by matching array name and property
+                // Try to find by matching array name, index, and property
                 for (Map.Entry<String, String> entry : replacements.entrySet()) {
                     String key = entry.getKey();
-                    if (key.contains("[i]") && key.contains(arrayName) && key.contains(property)) {
+                    if (key.contains("[" + indexStr + "]") && key.contains(arrayName) && key.contains(property)) {
                         replacementValue = entry.getValue();
                         break;
                     }
@@ -909,8 +914,8 @@ public class DocxTemplateService {
                         int iPos = runText.indexOf("[i]");
                         if (iPos > 0) {
                             String beforeI = runText.substring(Math.max(0, iPos - 30), iPos);
-                            // If [i] is preceded by $json. and {{, it's part of a placeholder
-                            if (!(beforeI.contains("$json.") && beforeI.contains("{{"))) {
+                            // If [i] is preceded by {{, it's part of a placeholder pattern
+                            if (!beforeI.contains("{{")) {
                                 RunFormatting formatting = extractRunFormatting(run);
                                 String newRunText = runText.replace("[i]", String.valueOf(currentIndex));
                                 paragraph.removeRun(i);
