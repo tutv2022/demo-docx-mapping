@@ -39,7 +39,7 @@ public class DocxTemplateService {
             
             // Step 2: Process paragraphs - unified processing for checkboxes and regular placeholders
             for (XWPFParagraph paragraph : document.getParagraphs()) {
-                processAllPlaceholders(paragraph, data);
+                processAllPlaceholders(paragraph, data, null, -1, data, null);
             }
 
             // Process tables
@@ -47,7 +47,7 @@ public class DocxTemplateService {
                 for (XWPFTableRow row : table.getRows()) {
                     for (XWPFTableCell cell : row.getTableCells()) {
                         for (XWPFParagraph paragraph : cell.getParagraphs()) {
-                            processAllPlaceholders(paragraph, data);
+                            processAllPlaceholders(paragraph, data, null, -1, data, null);
                         }
                     }
                 }
@@ -56,14 +56,14 @@ public class DocxTemplateService {
             // Process headers
             for (XWPFHeader header : document.getHeaderList()) {
                 for (XWPFParagraph paragraph : header.getParagraphs()) {
-                    processAllPlaceholders(paragraph, data);
+                    processAllPlaceholders(paragraph, data, null, -1, data, null);
                 }
             }
 
             // Process footers
             for (XWPFFooter footer : document.getFooterList()) {
                 for (XWPFParagraph paragraph : footer.getParagraphs()) {
-                    processAllPlaceholders(paragraph, data);
+                    processAllPlaceholders(paragraph, data, null, -1, data, null);
                 }
             }
 
@@ -382,9 +382,10 @@ public class DocxTemplateService {
                 XWPFParagraph newPara = new XWPFParagraph(newParaCT, document);
                 
                 // Process placeholders with item data, loop context, and current index
+                // Pass both the item and the original data map so we can access the list by index
                 // This must work correctly - if paragraph has no runs, it means it's empty and we skip it
                 if (!newPara.getRuns().isEmpty()) {
-                    processAllPlaceholders(newPara, item, loopVariable, itemIndex);
+                    processAllPlaceholders(newPara, item, loopVariable, itemIndex, data, items);
                 } else {
                     // If no runs, check if there's text in the CT element that needs processing
                     String paraText = getParagraphText(newPara);
@@ -393,7 +394,7 @@ public class DocxTemplateService {
                         // But if it does, create a run and process it
                         XWPFRun run = newPara.createRun();
                         run.setText(paraText);
-                        processAllPlaceholders(newPara, item, loopVariable, itemIndex);
+                        processAllPlaceholders(newPara, item, loopVariable, itemIndex, data, items);
                     }
                 }
                 
@@ -536,21 +537,23 @@ public class DocxTemplateService {
     }
 
     /**
-     * Processes radio buttons, checkboxes, and regular placeholders in a single pass
-     * This prevents duplication and ensures proper replacement
+     * Processes radio buttons, checkboxes, and regular placeholders while preserving formatting
+     * only for the placeholder variables themselves, not the entire paragraph.
      * New syntax: {{$json.variable}}, {{checkbox:$json.var:value}}, {{radio:$json.var:value}}
      * 
      * @param paragraph The paragraph to process
-     * @param data The data map
+     * @param data The data map (current item when in loop, or full data when not in loop)
      * @param loopArrayName Optional loop array name for handling [i] syntax (null if not in loop)
      * @param currentIndex Current index in the loop (for [i] syntax), -1 if not in loop
+     * @param originalData Original data map containing the list (for loop item access)
+     * @param itemsList The list of items (for loop item access by index)
      */
-    private void processAllPlaceholders(XWPFParagraph paragraph, Map<String, Object> data, String loopArrayName, int currentIndex) {
+    private void processAllPlaceholders(XWPFParagraph paragraph, Map<String, Object> data, String loopArrayName, int currentIndex, Map<String, Object> originalData, List<Map<String, Object>> itemsList) {
         if (paragraph.getRuns().isEmpty()) {
             return;
         }
 
-        // Collect all text from runs using safe method
+        // Collect all text from runs to check for placeholders
         String paragraphText = getParagraphText(paragraph);
         
         // Check if paragraph has any placeholders
@@ -568,151 +571,454 @@ public class DocxTemplateService {
             return; // No placeholders in this paragraph
         }
 
-        String replacedText = paragraphText;
+        // Build replacement map for all placeholders
+        Map<String, String> allReplacements = new HashMap<>();
 
-        // Step 1: Process loop item placeholders first ({{$json.arrayName[i].property}})
-        if (hasLoopItems && loopArrayName != null && currentIndex >= 0) {
+        // Step 1: Build replacement map for loop item placeholders ({{$json.arrayName[i].property}})
+        // Replace [i] with actual index and extract value from original data structure
+        if (hasLoopItems && loopArrayName != null && currentIndex >= 0 && originalData != null) {
             loopItemMatcher.reset();
-            Map<String, String> loopItemReplacements = new HashMap<>();
-            
             while (loopItemMatcher.find()) {
-                String arrayName = loopItemMatcher.group(1).trim(); // e.g., "orderItems" - trim whitespace
-                String property = loopItemMatcher.group(2).trim(); // e.g., "itemName" or "unitPrice" - trim whitespace
-                String fullPlaceholder = loopItemMatcher.group(0); // e.g., "{{$json.orderItems[i].itemName}}"
+                String arrayName = loopItemMatcher.group(1).trim();
+                String property = loopItemMatcher.group(2).trim();
+                String fullPlaceholder = loopItemMatcher.group(0); // e.g., {{$json.orderItems[i].unitPrice}}
                 
-                // Debug: Log what we found
-                // System.out.println("Found loop item placeholder: " + fullPlaceholder + ", arrayName: " + arrayName + ", property: " + property + ", loopArrayName: " + loopArrayName);
+                // Debug output - uncomment to see what's happening
+                // System.out.println("DEBUG Loop Item: placeholder=" + fullPlaceholder + ", arrayName=" + arrayName + ", property=" + property + ", loopArrayName=" + loopArrayName + ", currentIndex=" + currentIndex);
                 
-                // Only process if this matches the current loop array
                 if (arrayName.equals(loopArrayName)) {
-                    // Get the property value from current item data
-                    Object propertyValue = data.get(property);
-                    if (propertyValue == null) {
-                        // Try case-insensitive lookup as fallback
-                        for (Map.Entry<String, Object> entry : data.entrySet()) {
-                            if (entry.getKey().equalsIgnoreCase(property)) {
-                                propertyValue = entry.getValue();
-                                break;
+                    // Extract value from original data structure using the path: orderItems[index].property
+                    // For each iteration, we access: originalData.get("orderItems").get(currentIndex).get("property")
+                    Object propertyValue = null;
+                    
+                    // Get the list from original data
+                    Object listObj = originalData.get(arrayName);
+                    if (listObj == null) {
+                        // Debug: list not found
+                        // System.out.println("DEBUG: List '" + arrayName + "' not found in originalData. Available keys: " + originalData.keySet());
+                    } else if (!(listObj instanceof List)) {
+                        // Debug: not a list
+                        // System.out.println("DEBUG: '" + arrayName + "' is not a List, it's: " + listObj.getClass().getName());
+                    } else {
+                        @SuppressWarnings("unchecked")
+                        List<Object> items = (List<Object>) listObj;
+                        
+                        if (currentIndex >= items.size()) {
+                            // Debug: index out of bounds
+                            // System.out.println("DEBUG: Index " + currentIndex + " is out of bounds. List size: " + items.size());
+                        } else {
+                            Object itemObj = items.get(currentIndex);
+                            
+                            if (itemObj == null) {
+                                // Debug: null item
+                                // System.out.println("DEBUG: Item at index " + currentIndex + " is null");
+                            } else if (!(itemObj instanceof Map)) {
+                                // Debug: not a map
+                                // System.out.println("DEBUG: Item at index " + currentIndex + " is not a Map, it's: " + itemObj.getClass().getName());
+                            } else {
+                                @SuppressWarnings("unchecked")
+                                Map<String, Object> item = (Map<String, Object>) itemObj;
+                                
+                                // Debug: show available keys
+                                // System.out.println("DEBUG: Item keys: " + item.keySet() + ", looking for: " + property);
+                                
+                                // Try exact match first
+                                if (item.containsKey(property)) {
+                                    propertyValue = item.get(property);
+                                } else {
+                                    // Try case-insensitive lookup
+                                    for (Map.Entry<String, Object> entry : item.entrySet()) {
+                                        if (entry.getKey().equalsIgnoreCase(property)) {
+                                            propertyValue = entry.getValue();
+                                            break;
+                                        }
+                                    }
+                                }
+                                
+                                // Debug: show result
+                                // System.out.println("DEBUG: Property '" + property + "' value: " + propertyValue);
                             }
                         }
                     }
+                    
                     String value = propertyValue != null ? propertyValue.toString() : "";
-                    loopItemReplacements.put(fullPlaceholder, value);
+                    // Use the original placeholder (with [i]) as the key for replacement
+                    allReplacements.put(fullPlaceholder, value);
+                    
+                    // Debug: show replacement - UNCOMMENT TO DEBUG
+                    System.out.println("DEBUG: Adding replacement: " + fullPlaceholder + " -> " + value + " (index=" + currentIndex + ")");
+                } else {
+                    // Debug: array name mismatch
+                    System.out.println("DEBUG: Array name mismatch - placeholder: " + arrayName + ", loopArrayName: " + loopArrayName);
+                }
+            }
+        }
+        
+        // Debug: show all replacements
+        if (!allReplacements.isEmpty()) {
+            System.out.println("DEBUG: Total replacements: " + allReplacements.size() + " - " + allReplacements);
+        }
+
+        // Step 2: Build replacement map for radio button placeholders
+        if (hasRadios) {
+            radioMatcher.reset();
+            while (radioMatcher.find()) {
+                String radioGroupPath = radioMatcher.group(1);
+                String radioValue = radioMatcher.group(2);
+                String fullPlaceholder = radioMatcher.group(0);
+                
+                String radioGroup = extractVariableName(radioGroupPath);
+                Object groupValueObj = data.get(radioGroup);
+                String groupValue = groupValueObj != null ? groupValueObj.toString() : null;
+                boolean isSelected = radioValue.equalsIgnoreCase(groupValue);
+                
+                String radioSymbol = isSelected ? "◉" : "○";
+                allReplacements.put(fullPlaceholder, radioSymbol);
+            }
+        }
+
+        // Step 3: Build replacement map for checkbox placeholders
+        if (hasCheckboxes) {
+            checkboxMatcher.reset();
+            while (checkboxMatcher.find()) {
+                String checkboxGroupPath = checkboxMatcher.group(1);
+                String checkboxValue = checkboxMatcher.group(2);
+                String fullPlaceholder = checkboxMatcher.group(0);
+                
+                String checkboxGroup = extractVariableName(checkboxGroupPath);
+                Object groupValueObj = data.get(checkboxGroup);
+                String groupValue = groupValueObj != null ? groupValueObj.toString() : null;
+                boolean isChecked = checkboxValue.equalsIgnoreCase(groupValue);
+                
+                String checkboxSymbol = isChecked ? "☒" : "☐";
+                allReplacements.put(fullPlaceholder, checkboxSymbol);
+            }
+        }
+
+        // Step 4: Build replacement map for regular placeholders ({{$json.variableName}})
+        // IMPORTANT: Skip placeholders that were already processed in Step 1 (loop items)
+        // Loop item placeholders like {{$json.orderItems[i].property}} should not be processed here
+        if (hasRegularPlaceholders) {
+            regularMatcher.reset();
+            while (regularMatcher.find()) {
+                String variablePath = regularMatcher.group(1);
+                String fullPlaceholder = regularMatcher.group(0);
+
+                // Skip if this placeholder contains [i] - it's a loop item placeholder
+                // Loop item placeholders are already processed in Step 1
+                if (fullPlaceholder.contains("[i]")) {
+                    continue;
+                }
+                
+                // Skip if this placeholder was already added in Step 1
+                if (allReplacements.containsKey(fullPlaceholder)) {
+                    continue;
+                }
+
+                String variableName = extractVariableName(variablePath);
+                Object valueObj = data.get(variableName);
+                String value = valueObj != null ? valueObj.toString() : "";
+                allReplacements.put(fullPlaceholder, value);
+            }
+        }
+
+        // Step 5: Process runs individually to preserve formatting only for placeholders
+        if (!allReplacements.isEmpty()) {
+            // Debug: show all replacements
+            // System.out.println("DEBUG: All replacements: " + allReplacements);
+            processRunsWithPlaceholderFormatting(paragraph, allReplacements, currentIndex);
+        }
+    }
+
+    /**
+     * Processes runs individually, replacing placeholders while preserving their original formatting
+     * This ensures only placeholder text gets its formatting preserved, not the entire paragraph
+     * Handles placeholders that may span multiple runs
+     */
+    private void processRunsWithPlaceholderFormatting(XWPFParagraph paragraph, Map<String, String> replacements, int currentIndex) {
+        List<XWPFRun> runs = paragraph.getRuns();
+        if (runs.isEmpty()) {
+            return;
+        }
+
+        // Get full paragraph text to find all placeholders
+        String fullText = getParagraphText(paragraph);
+        if (fullText == null || fullText.isEmpty()) {
+            return;
+        }
+
+        // Process placeholders that exist in the full text
+        // This handles both single-run and multi-run placeholders
+        // Process from the end of the text backwards to avoid index shifting
+        List<PlaceholderPosition> placeholderPositions = new ArrayList<>();
+        
+        // First, find all loop item placeholders in the text using pattern matching
+        // This ensures we catch them even if whitespace differs
+        Matcher loopItemMatcher = LOOP_ITEM_PATTERN.matcher(fullText);
+        Map<String, String> loopItemMatches = new HashMap<>(); // Map from matched text to replacement value
+        while (loopItemMatcher.find()) {
+            String matchedText = loopItemMatcher.group(0);
+            String arrayName = loopItemMatcher.group(1).trim();
+            String property = loopItemMatcher.group(2).trim();
+            
+            // Build the key that should be in replacements map
+            String placeholderKey = "{{$json." + arrayName + "[i]." + property + "}}";
+            
+            // Find matching replacement (try exact match, then normalized)
+            String replacementValue = replacements.get(placeholderKey);
+            if (replacementValue == null) {
+                // Try to find by matching array name and property
+                for (Map.Entry<String, String> entry : replacements.entrySet()) {
+                    String key = entry.getKey();
+                    if (key.contains("[i]") && key.contains(arrayName) && key.contains(property)) {
+                        replacementValue = entry.getValue();
+                        break;
+                    }
                 }
             }
             
-            // Apply loop item replacements FIRST (before replacing standalone [i])
-            for (Map.Entry<String, String> entry : loopItemReplacements.entrySet()) {
-                replacedText = replacedText.replace(entry.getKey(), entry.getValue());
-            }
-            
-            // Then handle direct [i] references - replace standalone [i] with actual index value
-            // This allows using the index value directly in the template
-            // Since we've already processed all placeholders, we can safely replace remaining [i]
-            replacedText = replacedText.replace("[i]", String.valueOf(currentIndex));
-        }
-
-        // Step 2: Process radio button placeholders
-        if (hasRadios) {
-            radioMatcher.reset();
-            Map<String, String> radioReplacements = new HashMap<>();
-            
-            while (radioMatcher.find()) {
-                String radioGroupPath = radioMatcher.group(1); // e.g., "gender" (from $json.gender)
-                String radioValue = radioMatcher.group(2); // e.g., "male" or "female"
-                String fullPlaceholder = radioMatcher.group(0); // e.g., "{{radio:$json.gender:male}}"
-                
-                // Extract variable name from $json.variableName format
-                String radioGroup = extractVariableName(radioGroupPath);
-                
-                // Get the actual value for this group from data
-                Object groupValueObj = data.get(radioGroup);
-                String groupValue = groupValueObj != null ? groupValueObj.toString() : null;
-                
-                // Determine if this radio button should be selected
-                boolean isSelected = radioValue.equalsIgnoreCase(groupValue);
-                
-                // Replace with radio button symbol
-                String radioSymbol = isSelected ? "◉" : "○";
-                radioReplacements.put(fullPlaceholder, radioSymbol);
-            }
-            
-            // Apply radio button replacements
-            for (Map.Entry<String, String> entry : radioReplacements.entrySet()) {
-                replacedText = replacedText.replace(entry.getKey(), entry.getValue());
+            if (replacementValue != null) {
+                loopItemMatches.put(matchedText, replacementValue);
+                placeholderPositions.add(new PlaceholderPosition(loopItemMatcher.start(), matchedText, replacementValue));
             }
         }
-
-        // Step 3: Process checkbox placeholders
-        if (hasCheckboxes) {
-            checkboxMatcher.reset();
-            Map<String, String> checkboxReplacements = new HashMap<>();
+        
+        // Then find other placeholders (non-loop items) using exact matching
+        for (Map.Entry<String, String> replacement : replacements.entrySet()) {
+            String placeholder = replacement.getKey();
+            String replacementValue = replacement.getValue();
             
-            while (checkboxMatcher.find()) {
-                String checkboxGroupPath = checkboxMatcher.group(1); // e.g., "gender" (from $json.gender)
-                String checkboxValue = checkboxMatcher.group(2); // e.g., "male" or "female"
-                String fullPlaceholder = checkboxMatcher.group(0); // e.g., "{{checkbox:$json.gender:male}}"
-                
-                // Extract variable name from $json.variableName format
-                String checkboxGroup = extractVariableName(checkboxGroupPath);
-                
-                // Get the actual value for this group from data
-                Object groupValueObj = data.get(checkboxGroup);
-                String groupValue = groupValueObj != null ? groupValueObj.toString() : null;
-                
-                // Determine if this checkbox should be checked
-                boolean isChecked = checkboxValue.equalsIgnoreCase(groupValue);
-                
-                // Replace with checkbox symbol
-                String checkboxSymbol = isChecked ? "☒" : "☐";
-                checkboxReplacements.put(fullPlaceholder, checkboxSymbol);
+            // Skip if already processed as loop item
+            if (loopItemMatches.containsKey(placeholder)) {
+                continue;
             }
             
-            // Apply checkbox replacements
-            for (Map.Entry<String, String> entry : checkboxReplacements.entrySet()) {
-                replacedText = replacedText.replace(entry.getKey(), entry.getValue());
+            // Try exact match
+            int searchStart = 0;
+            while (true) {
+                int pos = fullText.indexOf(placeholder, searchStart);
+                if (pos < 0) {
+                    break;
+                }
+                placeholderPositions.add(new PlaceholderPosition(pos, placeholder, replacementValue));
+                searchStart = pos + 1;
             }
         }
-
-        // Step 4: Process regular placeholders ({{$json.variableName}})
-        if (hasRegularPlaceholders) {
-            regularMatcher.reset();
-            Map<String, String> placeholderReplacements = new HashMap<>();
+        
+        // Sort by position descending so we process from end to start
+        placeholderPositions.sort((a, b) -> Integer.compare(b.position, a.position));
+        
+        // Process each placeholder
+        for (PlaceholderPosition pp : placeholderPositions) {
+            // Refresh runs and fullText as they may have changed
+            runs = paragraph.getRuns();
+            fullText = getParagraphText(paragraph);
             
-            while (regularMatcher.find()) {
-                String variablePath = regularMatcher.group(1); // e.g., "customerName" from $json.customerName
-                String fullPlaceholder = regularMatcher.group(0); // e.g., "{{$json.customerName}}"
-                
-                // Extract variable name from $json.variableName format
-                String variableName = extractVariableName(variablePath);
-                
-                // Get value from data
-                Object valueObj = data.get(variableName);
-                String value = valueObj != null ? valueObj.toString() : "";
-                placeholderReplacements.put(fullPlaceholder, value);
+            // Check if placeholder still exists (might have been replaced already)
+            if (!fullText.contains(pp.placeholder)) {
+                continue;
             }
             
-            // Apply regular placeholder replacements
-            for (Map.Entry<String, String> entry : placeholderReplacements.entrySet()) {
-                replacedText = replacedText.replace(entry.getKey(), entry.getValue());
+            // Find the position again (might have shifted)
+            int placeholderPos = fullText.indexOf(pp.placeholder);
+            if (placeholderPos < 0) {
+                continue;
+            }
+            
+            // Find which run(s) contain this placeholder
+            RunRange runRange = findRunRangeForTextPosition(runs, placeholderPos, placeholderPos + pp.placeholder.length());
+            if (runRange == null) {
+                // Debug: placeholder not found in runs
+                // System.out.println("DEBUG processRuns: Could not find run range for placeholder: " + pp.placeholder + " at position: " + placeholderPos);
+                continue;
+            }
+            
+            // Debug: found run range
+            // System.out.println("DEBUG processRuns: Found run range for " + pp.placeholder + ": startRun=" + runRange.startRunIndex + ", endRun=" + runRange.endRunIndex);
+            
+            // Extract formatting from the first run containing the placeholder
+            RunFormatting formatting = extractRunFormatting(runs.get(runRange.startRunIndex));
+            
+            if (runRange.startRunIndex == runRange.endRunIndex) {
+                // Placeholder is in a single run
+                XWPFRun targetRun = runs.get(runRange.startRunIndex);
+                String runText = getRunText(targetRun);
+                if (runText != null && runText.contains(pp.placeholder)) {
+                    String newRunText = runText.replace(pp.placeholder, pp.replacementValue);
+                    int runIdx = runRange.startRunIndex;
+                    paragraph.removeRun(runIdx);
+                    XWPFRun newRun = paragraph.insertNewRun(runIdx);
+                    newRun.setText(newRunText);
+                    applyRunFormatting(formatting, newRun);
+                }
+            } else {
+                // Placeholder spans multiple runs - merge them
+                StringBuilder combinedText = new StringBuilder();
+                for (int i = runRange.startRunIndex; i <= runRange.endRunIndex; i++) {
+                    String runText = getRunText(runs.get(i));
+                    if (runText != null) {
+                        combinedText.append(runText);
+                    }
+                }
+                
+                String combined = combinedText.toString();
+                if (combined.contains(pp.placeholder)) {
+                    String newText = combined.replace(pp.placeholder, pp.replacementValue);
+                    
+                    // Remove all runs in the range (from end to start)
+                    for (int i = runRange.endRunIndex; i >= runRange.startRunIndex; i--) {
+                        paragraph.removeRun(i);
+                    }
+                    
+                    // Insert new run with replaced text and preserved formatting
+                    XWPFRun newRun = paragraph.insertNewRun(runRange.startRunIndex);
+                    newRun.setText(newText);
+                    applyRunFormatting(formatting, newRun);
+                }
             }
         }
-
-        // Only update if text changed
-        if (!replacedText.equals(paragraphText)) {
-            // Extract formatting before removing runs
-            RunFormatting formatting = extractRunFormatting(paragraph.getRuns().get(0));
+        
+        // Refresh runs and fullText after placeholder replacements
+        runs = paragraph.getRuns();
+        fullText = getParagraphText(paragraph);
+        
+        
+        // Also handle standalone [i] replacement if in loop context
+        // But ONLY if it's not part of a placeholder pattern
+        if (currentIndex >= 0) {
+            runs = paragraph.getRuns(); // Refresh runs list
+            fullText = getParagraphText(paragraph); // Get updated text
             
-            // Clear all runs
-            int runsCount = paragraph.getRuns().size();
-            for (int i = runsCount - 1; i >= 0; i--) {
-                paragraph.removeRun(i);
+            // Check if there are any remaining placeholders with [i] that should be replaced
+            // If there are, don't replace standalone [i] as it might break the placeholder
+            boolean hasUnreplacedPlaceholders = false;
+            for (String placeholder : replacements.keySet()) {
+                if (placeholder.contains("[i]") && fullText.contains(placeholder)) {
+                    hasUnreplacedPlaceholders = true;
+                    break;
+                }
             }
             
-            // Create new run with replaced text
-            XWPFRun newRun = paragraph.createRun();
-            newRun.setText(replacedText);
-            applyRunFormatting(formatting, newRun);
+            // Only replace standalone [i] if there are no unreplaced placeholders
+            if (!hasUnreplacedPlaceholders) {
+                for (int i = runs.size() - 1; i >= 0; i--) {
+                    XWPFRun run = runs.get(i);
+                    String runText = getRunText(run);
+                    if (runText != null && runText.contains("[i]")) {
+                        // Make sure [i] is not part of a placeholder pattern
+                        int iPos = runText.indexOf("[i]");
+                        if (iPos > 0) {
+                            String beforeI = runText.substring(Math.max(0, iPos - 30), iPos);
+                            // If [i] is preceded by $json. and {{, it's part of a placeholder
+                            if (!(beforeI.contains("$json.") && beforeI.contains("{{"))) {
+                                RunFormatting formatting = extractRunFormatting(run);
+                                String newRunText = runText.replace("[i]", String.valueOf(currentIndex));
+                                paragraph.removeRun(i);
+                                XWPFRun newRun = paragraph.insertNewRun(i);
+                                newRun.setText(newRunText);
+                                applyRunFormatting(formatting, newRun);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Finds which run(s) contain a text position range
+     */
+    private RunRange findRunRangeForTextPosition(List<XWPFRun> runs, int startPos, int endPos) {
+        int currentPos = 0;
+        int startRunIndex = -1;
+        int endRunIndex = -1;
+        XWPFRun startRun = null;
+        
+        for (int i = 0; i < runs.size(); i++) {
+            XWPFRun run = runs.get(i);
+            String runText = getRunText(run);
+            if (runText == null || runText.isEmpty()) {
+                continue;
+            }
+            
+            int runStart = currentPos;
+            int runEnd = currentPos + runText.length();
+            
+            // Check if this run contains the start position (inclusive start, exclusive end)
+            if (startRunIndex == -1 && startPos >= runStart && startPos < runEnd) {
+                startRunIndex = i;
+                startRun = run;
+            }
+            
+            // Check if this run contains the end position (exclusive end)
+            // endPos is exclusive, so we check if it's > runStart and <= runEnd
+            if (endPos > runStart && endPos <= runEnd) {
+                endRunIndex = i;
+                // Don't break yet - we need to make sure we found the start too
+                if (startRunIndex >= 0) {
+                    break;
+                }
+            }
+            
+            currentPos = runEnd;
+        }
+        
+        // If we found both start and end, return the range
+        // If we only found start, assume it's in a single run
+        if (startRunIndex >= 0) {
+            if (endRunIndex < 0) {
+                endRunIndex = startRunIndex; // Single run
+            }
+            return new RunRange(startRunIndex, endRunIndex, startRun);
+        }
+        
+        return null;
+    }
+
+    /**
+     * Helper class to track run range for a placeholder
+     */
+    private static class RunRange {
+        int startRunIndex;
+        int endRunIndex;
+        XWPFRun startRun;
+        
+        RunRange(int startRunIndex, int endRunIndex, XWPFRun startRun) {
+            this.startRunIndex = startRunIndex;
+            this.endRunIndex = endRunIndex;
+            this.startRun = startRun;
+        }
+    }
+
+    /**
+     * Helper class to track placeholder position and replacement
+     */
+    private static class PlaceholderPosition {
+        int position;
+        String placeholder;
+        String replacementValue;
+        
+        PlaceholderPosition(int position, String placeholder, String replacementValue) {
+            this.position = position;
+            this.placeholder = placeholder;
+            this.replacementValue = replacementValue;
+        }
+    }
+
+
+    /**
+     * Safely gets text from a run
+     */
+    private String getRunText(XWPFRun run) {
+        if (run == null) {
+            return null;
+        }
+        try {
+            return run.getText(0);
+        } catch (IndexOutOfBoundsException e) {
+            return null;
+        } catch (Exception e) {
+            return null;
         }
     }
 
@@ -720,7 +1026,7 @@ public class DocxTemplateService {
      * Overloaded method for backward compatibility (non-loop context)
      */
     private void processAllPlaceholders(XWPFParagraph paragraph, Map<String, Object> data) {
-        processAllPlaceholders(paragraph, data, null, -1);
+        processAllPlaceholders(paragraph, data, null, -1, data, null);
     }
 
     /**
