@@ -19,7 +19,8 @@ public class DocxTemplateService {
     private static final Pattern LOOP_START_PATTERN = Pattern.compile("\\{\\{#loop:\\s*\\$json\\.([^}]+)\\}\\}");
     private static final Pattern LOOP_END_PATTERN = Pattern.compile("\\{\\{#/loop\\}\\}");
     // Pattern for loop item access: {{$json.arrayName[i].property}}
-    private static final Pattern LOOP_ITEM_PATTERN = Pattern.compile("\\{\\{\\$json\\.([^\\[]+)\\[i\\]\\.([^}]+)\\}\\}");
+    // Allows optional whitespace and handles various property names
+    private static final Pattern LOOP_ITEM_PATTERN = Pattern.compile("\\{\\{\\s*\\$json\\.([^\\[\\}]+)\\[i\\]\\.([^\\}]+)\\s*\\}\\}");
 
     /**
      * Processes a DOCX template file by replacing placeholders with actual values
@@ -354,7 +355,10 @@ public class DocxTemplateService {
         // Create and insert paragraphs for each item
         int currentInsertPos = startParaIndex + 1;
         
-        for (Map<String, Object> item : items) {
+        // Use indexed loop to track current index for [i] syntax
+        for (int itemIndex = 0; itemIndex < items.size(); itemIndex++) {
+            Map<String, Object> item = items.get(itemIndex);
+            
             // Process each paragraph XML in the loop content
             for (String paraXml : loopContentXml) {
                 // Parse the XML to create a new CT element
@@ -377,10 +381,10 @@ public class DocxTemplateService {
                 // Create XWPFParagraph wrapper to process placeholders
                 XWPFParagraph newPara = new XWPFParagraph(newParaCT, document);
                 
-                // Process placeholders with item data and loop context
+                // Process placeholders with item data, loop context, and current index
                 // This must work correctly - if paragraph has no runs, it means it's empty and we skip it
                 if (!newPara.getRuns().isEmpty()) {
-                    processAllPlaceholders(newPara, item, loopVariable);
+                    processAllPlaceholders(newPara, item, loopVariable, itemIndex);
                 } else {
                     // If no runs, check if there's text in the CT element that needs processing
                     String paraText = getParagraphText(newPara);
@@ -389,7 +393,7 @@ public class DocxTemplateService {
                         // But if it does, create a run and process it
                         XWPFRun run = newPara.createRun();
                         run.setText(paraText);
-                        processAllPlaceholders(newPara, item, loopVariable);
+                        processAllPlaceholders(newPara, item, loopVariable, itemIndex);
                     }
                 }
                 
@@ -539,8 +543,9 @@ public class DocxTemplateService {
      * @param paragraph The paragraph to process
      * @param data The data map
      * @param loopArrayName Optional loop array name for handling [i] syntax (null if not in loop)
+     * @param currentIndex Current index in the loop (for [i] syntax), -1 if not in loop
      */
-    private void processAllPlaceholders(XWPFParagraph paragraph, Map<String, Object> data, String loopArrayName) {
+    private void processAllPlaceholders(XWPFParagraph paragraph, Map<String, Object> data, String loopArrayName, int currentIndex) {
         if (paragraph.getRuns().isEmpty()) {
             return;
         }
@@ -566,28 +571,45 @@ public class DocxTemplateService {
         String replacedText = paragraphText;
 
         // Step 1: Process loop item placeholders first ({{$json.arrayName[i].property}})
-        if (hasLoopItems && loopArrayName != null) {
+        if (hasLoopItems && loopArrayName != null && currentIndex >= 0) {
             loopItemMatcher.reset();
             Map<String, String> loopItemReplacements = new HashMap<>();
             
             while (loopItemMatcher.find()) {
-                String arrayName = loopItemMatcher.group(1); // e.g., "orderItems"
-                String property = loopItemMatcher.group(2); // e.g., "itemName"
+                String arrayName = loopItemMatcher.group(1).trim(); // e.g., "orderItems" - trim whitespace
+                String property = loopItemMatcher.group(2).trim(); // e.g., "itemName" or "unitPrice" - trim whitespace
                 String fullPlaceholder = loopItemMatcher.group(0); // e.g., "{{$json.orderItems[i].itemName}}"
+                
+                // Debug: Log what we found
+                // System.out.println("Found loop item placeholder: " + fullPlaceholder + ", arrayName: " + arrayName + ", property: " + property + ", loopArrayName: " + loopArrayName);
                 
                 // Only process if this matches the current loop array
                 if (arrayName.equals(loopArrayName)) {
                     // Get the property value from current item data
                     Object propertyValue = data.get(property);
+                    if (propertyValue == null) {
+                        // Try case-insensitive lookup as fallback
+                        for (Map.Entry<String, Object> entry : data.entrySet()) {
+                            if (entry.getKey().equalsIgnoreCase(property)) {
+                                propertyValue = entry.getValue();
+                                break;
+                            }
+                        }
+                    }
                     String value = propertyValue != null ? propertyValue.toString() : "";
                     loopItemReplacements.put(fullPlaceholder, value);
                 }
             }
             
-            // Apply loop item replacements
+            // Apply loop item replacements FIRST (before replacing standalone [i])
             for (Map.Entry<String, String> entry : loopItemReplacements.entrySet()) {
                 replacedText = replacedText.replace(entry.getKey(), entry.getValue());
             }
+            
+            // Then handle direct [i] references - replace standalone [i] with actual index value
+            // This allows using the index value directly in the template
+            // Since we've already processed all placeholders, we can safely replace remaining [i]
+            replacedText = replacedText.replace("[i]", String.valueOf(currentIndex));
         }
 
         // Step 2: Process radio button placeholders
@@ -698,7 +720,7 @@ public class DocxTemplateService {
      * Overloaded method for backward compatibility (non-loop context)
      */
     private void processAllPlaceholders(XWPFParagraph paragraph, Map<String, Object> data) {
-        processAllPlaceholders(paragraph, data, null);
+        processAllPlaceholders(paragraph, data, null, -1);
     }
 
     /**
