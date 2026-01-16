@@ -6,9 +6,7 @@ import com.jayway.jsonpath.JsonPath;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.core.io.Resource;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.MediaType;
-import org.springframework.http.ResponseEntity;
+import org.springframework.http.*;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.client.RestTemplate;
 import org.springframework.web.multipart.MultipartFile;
@@ -97,22 +95,50 @@ public class DocumentController {
     /**
      * Generate document from external API data
      * Calls external API, gets JSON response, and generates document using field paths from JSON
+     * Supports GET, POST, and PUT methods with JWT token authentication
      * 
      * @param templateName Name of template file in classpath resources/templates/
      * @param file Uploaded template file (alternative to templateName)
      * @param apiUrl Optional API URL (defaults to http://localhost:8011/api/order)
+     * @param method HTTP method (GET, POST, PUT) - defaults to GET
+     * @param jwtToken JWT token for authentication (can be provided via Authorization header or token parameter)
+     * @param requestBody Optional request body for POST/PUT requests
+     * @param authorizationHeader Authorization header from request (alternative to jwtToken parameter)
      * @return Processed DOCX file as byte array
      */
     @PostMapping("/generate-from-api")
     public ResponseEntity<byte[]> generateFromApi(
             @RequestParam(value = "template", required = false) String templateName,
             @RequestParam(value = "file", required = false) MultipartFile file,
-            @RequestParam(value = "apiUrl", required = false, defaultValue = "http://localhost:8011/api/order") String apiUrl) throws IOException {
+            @RequestParam(value = "apiUrl", required = false, defaultValue = "http://localhost:8011/api/order") String apiUrl,
+            @RequestParam(value = "method", required = false, defaultValue = "GET") String method,
+            @RequestParam(value = "token", required = false) String jwtToken,
+            @RequestParam(value = "requestBody", required = false) String requestBodyJson,
+            @RequestHeader(value = "Authorization", required = false) String authorizationHeader) throws IOException {
         
-        // Step 1: Call external API using RestTemplate and get response as JSON String
+        // Extract JWT token from Authorization header or parameter
+        String token = extractJwtToken(authorizationHeader, jwtToken);
+        
+        // Parse request body JSON if provided
+        Map<String, Object> requestBody = null;
+        if (requestBodyJson != null && !requestBodyJson.isEmpty()) {
+            try {
+                com.jayway.jsonpath.DocumentContext bodyContext = JsonPath.parse(requestBodyJson);
+                Object bodyObj = bodyContext.json();
+                if (bodyObj instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> bodyMap = (Map<String, Object>) bodyObj;
+                    requestBody = bodyMap;
+                }
+            } catch (Exception e) {
+                return ResponseEntity.badRequest().body(("Invalid request body JSON: " + e.getMessage()).getBytes());
+            }
+        }
+        
+        // Step 1: Call external API using RestTemplate with specified method and JWT token
         String jsonResponse;
         try {
-            jsonResponse = restTemplate.getForObject(apiUrl, String.class);
+            jsonResponse = callExternalApi(apiUrl, method, token, requestBody);
             if (jsonResponse == null || jsonResponse.isEmpty()) {
                 return ResponseEntity.badRequest().body("API returned empty response".getBytes());
             }
@@ -223,6 +249,75 @@ public class DocumentController {
                 variables.put(prefix, obj);
             }
         }
+    }
+
+    /**
+     * Extract JWT token from Authorization header or token parameter
+     * Supports "Bearer <token>" format in Authorization header
+     * 
+     * @param authorizationHeader Authorization header value
+     * @param jwtToken JWT token from parameter
+     * @return JWT token string
+     */
+    private String extractJwtToken(String authorizationHeader, String jwtToken) {
+        if (jwtToken != null && !jwtToken.isEmpty()) {
+            return jwtToken;
+        }
+        
+        if (authorizationHeader != null && !authorizationHeader.isEmpty()) {
+            // Remove "Bearer " prefix if present
+            if (authorizationHeader.startsWith("Bearer ")) {
+                return authorizationHeader.substring(7);
+            }
+            return authorizationHeader;
+        }
+        
+        return null;
+    }
+
+    /**
+     * Call external API with specified HTTP method and JWT token
+     * 
+     * @param apiUrl The API URL to call
+     * @param method HTTP method (GET, POST, PUT)
+     * @param jwtToken JWT token for authentication
+     * @param requestBody Request body for POST/PUT requests
+     * @return JSON response as String
+     * @throws IllegalArgumentException if HTTP method is not supported
+     */
+    private String callExternalApi(String apiUrl, String method, String jwtToken, Map<String, Object> requestBody) {
+        // Validate HTTP method
+        String upperMethod = method.toUpperCase();
+        if (!upperMethod.equals("GET") && !upperMethod.equals("POST") && !upperMethod.equals("PUT")) {
+            throw new IllegalArgumentException("Unsupported HTTP method: " + method + ". Supported methods: GET, POST, PUT");
+        }
+        
+        HttpMethod httpMethod = HttpMethod.valueOf(upperMethod);
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        
+        // Add JWT token to Authorization header if provided
+        if (jwtToken != null && !jwtToken.isEmpty()) {
+            headers.setBearerAuth(jwtToken);
+        }
+        
+        HttpEntity<?> entity;
+        
+        // Create request entity with body for POST/PUT
+        if ((httpMethod == HttpMethod.POST || httpMethod == HttpMethod.PUT) && requestBody != null) {
+            entity = new HttpEntity<>(requestBody, headers);
+        } else {
+            entity = new HttpEntity<>(headers);
+        }
+        
+        ResponseEntity<String> response = restTemplate.exchange(
+                apiUrl,
+                httpMethod,
+                entity,
+                String.class
+        );
+        
+        return response.getBody();
     }
 }
 
