@@ -37,6 +37,13 @@
             <version>${poi.version}</version>
         </dependency>
 
+        <!-- JSON-Path for JSON field extraction -->
+        <dependency>
+            <groupId>com.jayway.jsonpath</groupId>
+            <artifactId>json-path</artifactId>
+            <version>2.9.0</version>
+        </dependency>
+
         <!-- Spring Boot Starter Test -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
