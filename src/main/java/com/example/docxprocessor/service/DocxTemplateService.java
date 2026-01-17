@@ -508,8 +508,8 @@ public class DocxTemplateService {
     }
 
     /**
-     * Removes a placeholder pattern from a paragraph
-     * Preserves other text in the paragraph
+     * Removes a placeholder pattern from a paragraph while preserving formatting
+     * Preserves other text in the paragraph and maintains original formatting (bold, italic, etc.)
      * Removes ALL occurrences of the pattern, not just the first one
      */
     private void removePlaceholderFromParagraph(XWPFParagraph paragraph, Pattern pattern) {
@@ -517,40 +517,148 @@ public class DocxTemplateService {
             return;
         }
         
-        String text = getParagraphText(paragraph);
-        if (text == null || text.isEmpty()) {
+        List<XWPFRun> runs = paragraph.getRuns();
+        if (runs.isEmpty()) {
+            return;
+        }
+        
+        String fullText = getParagraphText(paragraph);
+        if (fullText == null || fullText.isEmpty()) {
             return;
         }
         
         // Check if the pattern exists in the text
-        Matcher matcher = pattern.matcher(text);
+        Matcher matcher = pattern.matcher(fullText);
         if (!matcher.find()) {
             return; // Pattern not found, nothing to remove
         }
         
-        // Replace ALL occurrences of the placeholder with empty string
-        String newText = pattern.matcher(text).replaceAll("");
-        // Clean up any extra whitespace
-        newText = newText.trim();
+        // Find all occurrences of the pattern
+        List<int[]> matches = new ArrayList<>();
+        matcher.reset();
+        while (matcher.find()) {
+            matches.add(new int[]{matcher.start(), matcher.end()});
+        }
         
-        // Clear all existing runs
-        int runsCount = paragraph.getRuns().size();
-        for (int i = runsCount - 1; i >= 0; i--) {
-            try {
-                paragraph.removeRun(i);
-            } catch (Exception e) {
-                // If removal fails, continue
+        // Process from end to start to avoid index shifting
+        matches.sort((a, b) -> Integer.compare(b[0], a[0]));
+        
+        for (int[] match : matches) {
+            int startPos = match[0];
+            int endPos = match[1];
+            
+            // Find which run(s) contain this marker
+            RunRange runRange = findRunRangeForTextPosition(runs, startPos, endPos);
+            if (runRange == null) {
                 continue;
+            }
+            
+            // Calculate positions within runs
+            int currentPos = 0;
+            int startPosInStartRun = -1;
+            int endPosInEndRun = -1;
+            
+            for (int i = 0; i < runs.size(); i++) {
+                XWPFRun run = runs.get(i);
+                String runText = getRunText(run);
+                if (runText == null || runText.isEmpty()) {
+                    continue;
+                }
+                
+                int runStart = currentPos;
+                int runEnd = currentPos + runText.length();
+                
+                if (i == runRange.startRunIndex && startPos >= runStart && startPos < runEnd) {
+                    startPosInStartRun = startPos - runStart;
+                }
+                
+                if (i == runRange.endRunIndex && endPos > runStart && endPos <= runEnd) {
+                    endPosInEndRun = endPos - runStart;
+                }
+                
+                currentPos = runEnd;
+            }
+            
+            // Remove the marker from the run(s) while preserving formatting
+            if (runRange.startRunIndex == runRange.endRunIndex) {
+                // Marker is in a single run
+                XWPFRun run = runs.get(runRange.startRunIndex);
+                String runText = getRunText(run);
+                if (runText != null && startPosInStartRun >= 0 && endPosInEndRun >= 0) {
+                    // Remove the marker from this run
+                    String beforeMarker = runText.substring(0, startPosInStartRun);
+                    String afterMarker = runText.substring(endPosInEndRun);
+                    String newRunText = beforeMarker + afterMarker;
+                    
+                    // Extract formatting before modifying
+                    RunFormatting formatting = extractRunFormatting(run);
+                    
+                    // Update the run text (preserves formatting)
+                    run.setText(newRunText, 0);
+                    
+                    // Reapply formatting
+                    applyRunFormatting(formatting, run);
+                }
+            } else {
+                // Marker spans multiple runs
+                // First run: keep text before marker
+                if (runRange.startRunIndex >= 0 && runRange.startRunIndex < runs.size()) {
+                    XWPFRun firstRun = runs.get(runRange.startRunIndex);
+                    String firstRunText = getRunText(firstRun);
+                    if (firstRunText != null && startPosInStartRun >= 0) {
+                        RunFormatting formatting = extractRunFormatting(firstRun);
+                        String beforeMarker = firstRunText.substring(0, startPosInStartRun);
+                        firstRun.setText(beforeMarker, 0);
+                        applyRunFormatting(formatting, firstRun);
+                    } else {
+                        firstRun.setText("", 0);
+                    }
+                }
+                
+                // Last run: keep text after marker
+                if (runRange.endRunIndex >= 0 && runRange.endRunIndex < runs.size()) {
+                    XWPFRun lastRun = runs.get(runRange.endRunIndex);
+                    String lastRunText = getRunText(lastRun);
+                    if (lastRunText != null && endPosInEndRun >= 0 && endPosInEndRun < lastRunText.length()) {
+                        RunFormatting formatting = extractRunFormatting(lastRun);
+                        String afterMarker = lastRunText.substring(endPosInEndRun);
+                        lastRun.setText(afterMarker, 0);
+                        applyRunFormatting(formatting, lastRun);
+                    } else {
+                        lastRun.setText("", 0);
+                    }
+                }
+                
+                // Remove middle runs (if any)
+                for (int i = runRange.endRunIndex - 1; i > runRange.startRunIndex; i--) {
+                    try {
+                        paragraph.removeRun(i);
+                    } catch (Exception e) {
+                        // If removal fails, just clear the text
+                        runs.get(i).setText("", 0);
+                    }
+                }
             }
         }
         
-        // Add the new text (without the placeholder) if there's any remaining text
-        if (!newText.isEmpty()) {
+        // Clean up empty runs
+        cleanupEmptyRuns(paragraph);
+    }
+    
+    /**
+     * Removes empty runs from a paragraph
+     */
+    private void cleanupEmptyRuns(XWPFParagraph paragraph) {
+        List<XWPFRun> runs = paragraph.getRuns();
+        for (int i = runs.size() - 1; i >= 0; i--) {
             try {
-                XWPFRun newRun = paragraph.createRun();
-                newRun.setText(newText);
+                XWPFRun run = runs.get(i);
+                String text = run.getText(0);
+                if (text == null || text.trim().isEmpty()) {
+                    paragraph.removeRun(i);
+                }
             } catch (Exception e) {
-                // If creating run fails, the paragraph will be empty
+                // Skip if we can't check or remove
             }
         }
     }
@@ -898,7 +1006,7 @@ public class DocxTemplateService {
                 loopItemMatches.put(matchedText, replacementValue);
                 placeholderPositions.add(new PlaceholderPosition(loopItemMatcher.start(), matchedText, replacementValue));
             } else {
-                // If no replacement found, add empty string to avoid keeping the placeholder
+                // If no replacement found, replace with empty string
                 loopItemMatches.put(matchedText, "");
                 placeholderPositions.add(new PlaceholderPosition(loopItemMatcher.start(), matchedText, ""));
             }
@@ -960,6 +1068,7 @@ public class DocxTemplateService {
             // Extract formatting from the first run containing the placeholder
             RunFormatting formatting = extractRunFormatting(runs.get(runRange.startRunIndex));
             
+            // Replace the placeholder with the replacement value (empty string if path not found)
             if (runRange.startRunIndex == runRange.endRunIndex) {
                 // Placeholder is in a single run
                 XWPFRun targetRun = runs.get(runRange.startRunIndex);
@@ -1692,8 +1801,8 @@ public class DocxTemplateService {
 
         // Step 1: Process loop item placeholders using JSON-Path
         // Replace [i] with actual numeric index
-        if (hasLoopItems && originalJsonContext != null) {
-            System.out.println("DEBUG: Processing loop items, originalJsonContext is not null");
+        if (hasLoopItems) {
+            System.out.println("DEBUG: Processing loop items, originalJsonContext is " + (originalJsonContext != null ? "not null" : "null"));
             loopItemMatcher.reset();
             int matchCount = 0;
             while (loopItemMatcher.find()) {
@@ -1704,6 +1813,13 @@ public class DocxTemplateService {
                 String fullPlaceholder = loopItemMatcher.group(0);
                 
                 System.out.println("DEBUG: Found loop item placeholder: " + fullPlaceholder + ", arrayName=" + arrayName + ", indexStr=" + indexStr + ", property=" + property);
+                
+                // If originalJsonContext is null, replace with empty string
+                if (originalJsonContext == null) {
+                    System.out.println("WARN: originalJsonContext is null for placeholder: " + fullPlaceholder + " - Replacing with empty string");
+                    allReplacements.put(fullPlaceholder, "");
+                    continue;
+                }
                 
                 int targetIndex = -1;
                 if (indexStr.equalsIgnoreCase("i")) {
@@ -1718,7 +1834,9 @@ public class DocxTemplateService {
                         System.out.println("DEBUG: Setting targetIndex to " + targetIndex);
                     } else {
                         // Not in a loop context (currentIndex < 0), cannot replace [i]
-                        System.out.println("DEBUG: currentIndex < 0, skipping this placeholder");
+                        // Still add to replacements with empty string so it gets replaced
+                        System.out.println("WARN: currentIndex < 0 for placeholder with [i]: " + fullPlaceholder + " - Replacing with empty string");
+                        allReplacements.put(fullPlaceholder, "");
                         continue;
                     }
                 } else {
@@ -1727,8 +1845,9 @@ public class DocxTemplateService {
                         targetIndex = Integer.parseInt(indexStr);
                         System.out.println("DEBUG: Parsed numeric index: " + targetIndex);
                     } catch (NumberFormatException e) {
-                        // Invalid index format, skip
-                        System.out.println("DEBUG: Invalid index format: " + indexStr);
+                        // Invalid index format, still replace with empty string
+                        System.out.println("WARN: Invalid index format: " + indexStr + " for placeholder: " + fullPlaceholder + " - Replacing with empty string");
+                        allReplacements.put(fullPlaceholder, "");
                         continue;
                     }
                 }
@@ -1736,6 +1855,7 @@ public class DocxTemplateService {
                 // Validate index bounds if itemsList is provided
                 if (itemsList != null) {
                     if (targetIndex < 0 || targetIndex >= itemsList.size()) {
+                        System.out.println("WARN: Index out of bounds: " + targetIndex + " for array size: " + itemsList.size() + " for placeholder: " + fullPlaceholder + " - Replacing with empty string");
                         allReplacements.put(fullPlaceholder, "");
                         continue;
                     }
@@ -1752,12 +1872,12 @@ public class DocxTemplateService {
                     allReplacements.put(fullPlaceholder, valueStr);
                     System.out.println("DEBUG: Extracted value: " + valueStr + " for placeholder: " + fullPlaceholder);
                 } catch (PathNotFoundException e) {
-                    // Path not found
-                    System.out.println("DEBUG: Path not found: " + jsonPathExpr);
+                    // Path not found - replace with empty string and log
+                    System.out.println("WARN: JSON-Path not found: " + jsonPathExpr + " for placeholder: " + fullPlaceholder + " - Replacing with empty string");
                     allReplacements.put(fullPlaceholder, "");
                 } catch (Exception e) {
-                    // Any other error
-                    System.out.println("DEBUG: Error reading JSON-Path " + jsonPathExpr + ": " + e.getMessage());
+                    // Any other error - replace with empty string and log
+                    System.out.println("ERROR: Error reading JSON-Path " + jsonPathExpr + " for placeholder: " + fullPlaceholder + " - " + e.getMessage() + " - Replacing with empty string");
                     allReplacements.put(fullPlaceholder, "");
                 }
             }
@@ -1833,6 +1953,12 @@ public class DocxTemplateService {
                     String value = valueObj != null ? valueObj.toString() : "";
                     allReplacements.put(fullPlaceholder, value);
                 } catch (PathNotFoundException e) {
+                    // Path not found - replace with empty string and log
+                    System.out.println("WARN: JSON-Path not found: " + jsonPathExpr + " for placeholder: " + fullPlaceholder + " - Replacing with empty string");
+                    allReplacements.put(fullPlaceholder, "");
+                } catch (Exception e) {
+                    // Any other error - replace with empty string and log
+                    System.out.println("ERROR: Error reading JSON-Path " + jsonPathExpr + " for placeholder: " + fullPlaceholder + " - " + e.getMessage() + " - Replacing with empty string");
                     allReplacements.put(fullPlaceholder, "");
                 }
             }
@@ -1868,18 +1994,33 @@ public class DocxTemplateService {
 
     /**
      * Processes table row loops using JSON-Path
-     * Syntax: {{#loop:$arrayName}} in first cell, {{#/loop}} in last cell
-     * The entire row will be duplicated for each item in the array
+     * Supports two syntaxes:
+     * 1. Single row: {{#loop:$arrayName}} and {{#/loop}} in the same row
+     * 2. Multiple rows: {{#loop:$arrayName}} in one row, {{#/loop}} in a different row
+     * 
+     * The row(s) will be duplicated for each item in the array
      * Use {{$arrayName[i].property}} in cells to access item properties
      * 
-     * Example:
-     * | {{#loop:$orderItems}} | {{$orderItems[i].itemName}} | {{$orderItems[i].quantity}} | {{$orderItems[i].unitPrice}} {{#/loop}} |
+     * Examples:
+     * Single row: | {{#loop:$orderItems}} | {{$orderItems[i].itemName}} | {{$orderItems[i].quantity}} | {{#/loop}} |
+     * Multiple rows: 
+     *   Row 1: | {{#loop:$orderItems}} | Header 1 | Header 2 |
+     *   Row 2: | {{$orderItems[i].itemName}} | {{$orderItems[i].quantity}} | {{$orderItems[i].unitPrice}} |
+     *   Row 3: | Footer | {{#/loop}} | Total |
      */
     private void processTableLoopsWithJsonPath(XWPFTable table, DocumentContext jsonContext) {
         // Get a snapshot of rows to avoid concurrent modification issues
         List<XWPFTableRow> rows = new ArrayList<>(table.getRows());
         
-        // Process rows from end to start to avoid index shifting issues
+        // First, find and process multi-row loops (from end to start to avoid index shifting)
+        List<MultiRowLoopInfo> multiRowLoops = findMultiRowLoops(rows);
+        for (MultiRowLoopInfo multiRowLoop : multiRowLoops) {
+            processMultiRowLoop(table, multiRowLoop, jsonContext);
+        }
+        
+        // Then, process single-row loops (from end to start to avoid index shifting)
+        // Refresh rows list as multi-row loops may have modified the table
+        rows = new ArrayList<>(table.getRows());
         for (int rowIndex = rows.size() - 1; rowIndex >= 0; rowIndex--) {
             try {
                 XWPFTableRow row = rows.get(rowIndex);
@@ -1887,10 +2028,10 @@ public class DocxTemplateService {
                     continue;
                 }
                 
-                // Check if this row contains both loop start and end markers
+                // Check if this row contains both loop start and end markers (single-row loop)
                 LoopMarkerInfo markerInfo = findLoopMarkersInRow(row);
                 if (markerInfo != null) {
-                    // Process this loop row
+                    // Process this single-row loop
                     processTableLoopRow(table, row, rowIndex, markerInfo, jsonContext);
                 }
             } catch (IndexOutOfBoundsException e) {
@@ -1910,6 +2051,25 @@ public class DocxTemplateService {
         
         LoopMarkerInfo(String arrayName, int startCellIndex, int endCellIndex) {
             this.arrayName = arrayName;
+            this.startCellIndex = startCellIndex;
+            this.endCellIndex = endCellIndex;
+        }
+    }
+    
+    /**
+     * Information about loop markers spanning multiple rows
+     */
+    private static class MultiRowLoopInfo {
+        String arrayName;
+        int startRowIndex;   // Row index containing {{#loop:$arrayName}}
+        int endRowIndex;     // Row index containing {{#/loop}}
+        int startCellIndex;  // Cell index in start row containing {{#loop:$arrayName}}
+        int endCellIndex;    // Cell index in end row containing {{#/loop}}
+        
+        MultiRowLoopInfo(String arrayName, int startRowIndex, int endRowIndex, int startCellIndex, int endCellIndex) {
+            this.arrayName = arrayName;
+            this.startRowIndex = startRowIndex;
+            this.endRowIndex = endRowIndex;
             this.startCellIndex = startCellIndex;
             this.endCellIndex = endCellIndex;
         }
@@ -1975,6 +2135,249 @@ public class DocxTemplateService {
         }
         
         return null;
+    }
+
+    /**
+     * Finds loop markers that span multiple rows
+     * Returns a list of MultiRowLoopInfo sorted by start row index (descending for safe processing)
+     */
+    private List<MultiRowLoopInfo> findMultiRowLoops(List<XWPFTableRow> rows) {
+        List<MultiRowLoopInfo> multiRowLoops = new ArrayList<>();
+        
+        // Find all start markers and end markers
+        Map<Integer, String> startMarkers = new HashMap<>(); // rowIndex -> arrayName
+        Map<Integer, Integer> startCellIndices = new HashMap<>(); // rowIndex -> cellIndex
+        Map<Integer, Integer> endCellIndices = new HashMap<>(); // rowIndex -> cellIndex
+        
+        for (int rowIndex = 0; rowIndex < rows.size(); rowIndex++) {
+            XWPFTableRow row = rows.get(rowIndex);
+            if (row == null) {
+                continue;
+            }
+            
+            List<XWPFTableCell> cells = row.getTableCells();
+            if (cells == null || cells.isEmpty()) {
+                continue;
+            }
+            
+            for (int cellIndex = 0; cellIndex < cells.size(); cellIndex++) {
+                try {
+                    XWPFTableCell cell = cells.get(cellIndex);
+                    if (cell == null) {
+                        continue;
+                    }
+                    
+                    for (XWPFParagraph paragraph : cell.getParagraphs()) {
+                        if (paragraph == null) {
+                            continue;
+                        }
+                        
+                        String text = getParagraphText(paragraph);
+                        if (text != null) {
+                            // Check for loop start marker
+                            Matcher startMatcher = LOOP_START_PATTERN.matcher(text);
+                            if (startMatcher.find()) {
+                                String loopVariablePath = startMatcher.group(1);
+                                String arrayName = extractVariableName(loopVariablePath);
+                                startMarkers.put(rowIndex, arrayName);
+                                startCellIndices.put(rowIndex, cellIndex);
+                            }
+                            
+                            // Check for loop end marker
+                            Matcher endMatcher = LOOP_END_PATTERN.matcher(text);
+                            if (endMatcher.find()) {
+                                endCellIndices.put(rowIndex, cellIndex);
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    continue;
+                }
+            }
+        }
+        
+        // Match start markers with end markers (find the closest end marker after each start marker)
+        for (Map.Entry<Integer, String> startEntry : startMarkers.entrySet()) {
+            int startRowIndex = startEntry.getKey();
+            String arrayName = startEntry.getValue();
+            int startCellIndex = startCellIndices.get(startRowIndex);
+            
+            // Find the closest end marker after this start marker
+            int endRowIndex = -1;
+            int endCellIndex = -1;
+            
+            for (Map.Entry<Integer, Integer> endEntry : endCellIndices.entrySet()) {
+                int candidateEndRow = endEntry.getKey();
+                if (candidateEndRow > startRowIndex) {
+                    // Check if this row doesn't have a start marker (to avoid matching with nested loops)
+                    // For simplicity, we'll match with the first end marker after start
+                    if (endRowIndex == -1 || candidateEndRow < endRowIndex) {
+                        endRowIndex = candidateEndRow;
+                        endCellIndex = endEntry.getValue();
+                    }
+                }
+            }
+            
+            // Only create multi-row loop if end marker is in a different row
+            if (endRowIndex > startRowIndex) {
+                // Check if this is not a single-row loop (both markers in same row)
+                LoopMarkerInfo singleRowCheck = findLoopMarkersInRow(rows.get(startRowIndex));
+                if (singleRowCheck == null) {
+                    // This is a multi-row loop
+                    multiRowLoops.add(new MultiRowLoopInfo(arrayName, startRowIndex, endRowIndex, startCellIndex, endCellIndex));
+                }
+            }
+        }
+        
+        // Sort by start row index descending for safe processing (process from end to start)
+        multiRowLoops.sort((a, b) -> Integer.compare(b.startRowIndex, a.startRowIndex));
+        
+        return multiRowLoops;
+    }
+
+    /**
+     * Processes a multi-row loop
+     * Clones all rows between start and end markers for each item in the array
+     */
+    @SuppressWarnings("unchecked")
+    private void processMultiRowLoop(XWPFTable table, MultiRowLoopInfo loopInfo, DocumentContext jsonContext) {
+        // Get the array from JSON using JSON-Path
+        String jsonPathExpr = "$." + loopInfo.arrayName;
+        Object listObj;
+        try {
+            listObj = jsonContext.read(jsonPathExpr);
+        } catch (PathNotFoundException e) {
+            // Array not found, remove the loop markers and return
+            removeLoopMarkersFromMultiRow(table, loopInfo);
+            return;
+        }
+        
+        if (!(listObj instanceof List)) {
+            // Not a list, remove the loop markers and return
+            removeLoopMarkersFromMultiRow(table, loopInfo);
+            return;
+        }
+        
+        List<Object> items = (List<Object>) listObj;
+        if (items.isEmpty()) {
+            // Empty list, remove all rows between start and end (inclusive)
+            List<XWPFTableRow> rows = table.getRows();
+            for (int i = loopInfo.endRowIndex; i >= loopInfo.startRowIndex; i--) {
+                if (i >= 0 && i < rows.size()) {
+                    try {
+                        table.removeRow(i);
+                    } catch (Exception e) {
+                        // Skip if removal fails
+                    }
+                }
+            }
+            return;
+        }
+        
+        // Get all rows between start and end (inclusive)
+        List<XWPFTableRow> templateRows = new ArrayList<>();
+        List<String> templateRowXmls = new ArrayList<>();
+        List<XWPFTableRow> rows = table.getRows();
+        
+        for (int i = loopInfo.startRowIndex; i <= loopInfo.endRowIndex && i < rows.size(); i++) {
+            XWPFTableRow row = rows.get(i);
+            if (row != null) {
+                templateRows.add(row);
+                templateRowXmls.add(row.getCtRow().xmlText());
+            }
+        }
+        
+        if (templateRows.isEmpty()) {
+            return;
+        }
+        
+        // Process the first set of rows (index 0) - remove markers and process placeholders
+        for (int rowIdx = 0; rowIdx < templateRows.size(); rowIdx++) {
+            XWPFTableRow row = templateRows.get(rowIdx);
+            LoopMarkerInfo markerInfo = new LoopMarkerInfo(loopInfo.arrayName, 
+                (rowIdx == 0) ? loopInfo.startCellIndex : -1,
+                (rowIdx == templateRows.size() - 1) ? loopInfo.endCellIndex : -1);
+            processTableRowForItem(row, jsonContext, loopInfo.arrayName, 0, jsonContext, items, markerInfo);
+        }
+        
+        // Clone and insert additional sets of rows for remaining items
+        if (items.size() > 1) {
+            int insertPosition = loopInfo.endRowIndex + 1;
+            
+            for (int itemIndex = 1; itemIndex < items.size(); itemIndex++) {
+                // Clone all template rows for this item
+                for (int rowIdx = 0; rowIdx < templateRowXmls.size(); rowIdx++) {
+                    try {
+                        String templateRowXml = templateRowXmls.get(rowIdx);
+                        
+                        // Parse the cloned row XML
+                        org.openxmlformats.schemas.wordprocessingml.x2006.main.CTRow clonedRowCT =
+                            org.openxmlformats.schemas.wordprocessingml.x2006.main.CTRow.Factory.parse(templateRowXml);
+                        
+                        // Get current table size before insertion
+                        int currentTableSize = table.getCTTbl().sizeOfTrArray();
+                        
+                        // Validate insert position
+                        if (insertPosition > currentTableSize) {
+                            insertPosition = currentTableSize;
+                        }
+                        if (insertPosition < 0) {
+                            insertPosition = 0;
+                        }
+                        
+                        // Insert a new empty row at the specified position
+                        table.getCTTbl().insertNewTr(insertPosition);
+                        
+                        // Replace the empty row with our cloned row content
+                        table.getCTTbl().setTrArray(insertPosition, clonedRowCT);
+                        
+                        // Get the CTRow we just set
+                        org.openxmlformats.schemas.wordprocessingml.x2006.main.CTRow rowCT = 
+                            table.getCTTbl().getTrArray(insertPosition);
+                        if (rowCT == null) {
+                            insertPosition++;
+                            continue;
+                        }
+                        
+                        // Create XWPFTableRow wrapper from the CTRow
+                        XWPFTableRow newRow = new XWPFTableRow(rowCT, table);
+                        
+                        // Process the new row for this item
+                        LoopMarkerInfo markerInfo = new LoopMarkerInfo(loopInfo.arrayName,
+                            (rowIdx == 0) ? loopInfo.startCellIndex : -1,
+                            (rowIdx == templateRowXmls.size() - 1) ? loopInfo.endCellIndex : -1);
+                        processTableRowForItem(newRow, jsonContext, loopInfo.arrayName, itemIndex, jsonContext, items, markerInfo);
+                        
+                        insertPosition++;
+                    } catch (Exception e) {
+                        System.out.println("DEBUG: Exception cloning multi-row loop row: " + e.getMessage());
+                        e.printStackTrace();
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * Removes loop markers from a multi-row loop
+     */
+    private void removeLoopMarkersFromMultiRow(XWPFTable table, MultiRowLoopInfo loopInfo) {
+        List<XWPFTableRow> rows = table.getRows();
+        if (loopInfo.startRowIndex >= 0 && loopInfo.startRowIndex < rows.size()) {
+            XWPFTableRow startRow = rows.get(loopInfo.startRowIndex);
+            if (startRow != null) {
+                LoopMarkerInfo startMarkerInfo = new LoopMarkerInfo(loopInfo.arrayName, loopInfo.startCellIndex, -1);
+                removeLoopMarkersFromRow(startRow, startMarkerInfo);
+            }
+        }
+        if (loopInfo.endRowIndex >= 0 && loopInfo.endRowIndex < rows.size()) {
+            XWPFTableRow endRow = rows.get(loopInfo.endRowIndex);
+            if (endRow != null) {
+                LoopMarkerInfo endMarkerInfo = new LoopMarkerInfo(loopInfo.arrayName, -1, loopInfo.endCellIndex);
+                removeLoopMarkersFromRow(endRow, endMarkerInfo);
+            }
+        }
     }
 
     /**
