@@ -101,12 +101,17 @@ public class DocxTemplateService {
             // Step 1: Process loops first (they can contain placeholders)
             processLoopsWithJsonPath(document, jsonContext);
             
-            // Step 2: Process paragraphs - unified processing for checkboxes and regular placeholders
+            // Step 2: Process table row loops BEFORE processing regular placeholders
+            for (XWPFTable table : document.getTables()) {
+                processTableLoopsWithJsonPath(table, jsonContext);
+            }
+            
+            // Step 3: Process paragraphs - unified processing for checkboxes and regular placeholders
             for (XWPFParagraph paragraph : document.getParagraphs()) {
                 processAllPlaceholdersWithJsonPath(paragraph, jsonContext, null, -1, jsonContext, null);
             }
 
-            // Process tables
+            // Step 4: Process tables - regular placeholders (after loops are processed)
             for (XWPFTable table : document.getTables()) {
                 for (XWPFTableRow row : table.getRows()) {
                     for (XWPFTableCell cell : row.getTableCells()) {
@@ -504,20 +509,48 @@ public class DocxTemplateService {
 
     /**
      * Removes a placeholder pattern from a paragraph
+     * Preserves other text in the paragraph
+     * Removes ALL occurrences of the pattern, not just the first one
      */
     private void removePlaceholderFromParagraph(XWPFParagraph paragraph, Pattern pattern) {
-        String text = paragraph.getText();
+        if (paragraph == null) {
+            return;
+        }
+        
+        String text = getParagraphText(paragraph);
+        if (text == null || text.isEmpty()) {
+            return;
+        }
+        
+        // Check if the pattern exists in the text
         Matcher matcher = pattern.matcher(text);
-        if (matcher.find()) {
-            String newText = text.replace(matcher.group(0), "").trim();
-            // Clear and recreate runs
-            int runsCount = paragraph.getRuns().size();
-            for (int i = runsCount - 1; i >= 0; i--) {
+        if (!matcher.find()) {
+            return; // Pattern not found, nothing to remove
+        }
+        
+        // Replace ALL occurrences of the placeholder with empty string
+        String newText = pattern.matcher(text).replaceAll("");
+        // Clean up any extra whitespace
+        newText = newText.trim();
+        
+        // Clear all existing runs
+        int runsCount = paragraph.getRuns().size();
+        for (int i = runsCount - 1; i >= 0; i--) {
+            try {
                 paragraph.removeRun(i);
+            } catch (Exception e) {
+                // If removal fails, continue
+                continue;
             }
-            if (!newText.isEmpty()) {
+        }
+        
+        // Add the new text (without the placeholder) if there's any remaining text
+        if (!newText.isEmpty()) {
+            try {
                 XWPFRun newRun = paragraph.createRun();
                 newRun.setText(newText);
+            } catch (Exception e) {
+                // If creating run fails, the paragraph will be empty
             }
         }
     }
@@ -829,16 +862,32 @@ public class DocxTemplateService {
             String indexStr = loopItemMatcher.group(2).trim(); // Can be "i" or a number
             String property = loopItemMatcher.group(3).trim();
             
-            // Build the key that should be in replacements map (with the actual index from match)
+            // Build the key that should be in replacements map
+            // The key in replacements map has [i] or [number], we need to match it
             String placeholderKey = "{{$" + arrayName + "[" + indexStr + "]." + property + "}}";
+            
+            // Normalize the key (remove extra whitespace) to match
+            String normalizedKey = placeholderKey.replaceAll("\\s+", "");
             
             // Find matching replacement (try exact match first)
             String replacementValue = replacements.get(placeholderKey);
             if (replacementValue == null) {
-                // Try to find by matching array name, index, and property
+                // Try normalized key
+                replacementValue = replacements.get(normalizedKey);
+            }
+            if (replacementValue == null) {
+                // Try to find by matching array name, index, and property (case-insensitive)
                 for (Map.Entry<String, String> entry : replacements.entrySet()) {
                     String key = entry.getKey();
-                    if (key.contains("[" + indexStr + "]") && key.contains(arrayName) && key.contains(property)) {
+                    String normalizedEntryKey = key.replaceAll("\\s+", "");
+                    if (normalizedEntryKey.equalsIgnoreCase(normalizedKey)) {
+                        replacementValue = entry.getValue();
+                        break;
+                    }
+                    // Also try partial match
+                    if (key.contains("[" + indexStr + "]") && 
+                        key.toLowerCase().contains(arrayName.toLowerCase()) && 
+                        key.contains(property)) {
                         replacementValue = entry.getValue();
                         break;
                     }
@@ -848,6 +897,10 @@ public class DocxTemplateService {
             if (replacementValue != null) {
                 loopItemMatches.put(matchedText, replacementValue);
                 placeholderPositions.add(new PlaceholderPosition(loopItemMatcher.start(), matchedText, replacementValue));
+            } else {
+                // If no replacement found, add empty string to avoid keeping the placeholder
+                loopItemMatches.put(matchedText, "");
+                placeholderPositions.add(new PlaceholderPosition(loopItemMatcher.start(), matchedText, ""));
             }
         }
         
@@ -1610,6 +1663,14 @@ public class DocxTemplateService {
 
         String paragraphText = getParagraphText(paragraph);
         
+        // Debug: Log paragraph text and currentIndex
+        System.out.println("DEBUG processAllPlaceholdersWithJsonPath: paragraphText='" + paragraphText + "', currentIndex=" + currentIndex + ", loopArrayName=" + loopArrayName);
+        
+        if (paragraphText == null || paragraphText.trim().isEmpty()) {
+            System.out.println("DEBUG: Paragraph text is null or empty, returning");
+            return;
+        }
+        
         Matcher radioMatcher = RADIO_PATTERN.matcher(paragraphText);
         Matcher checkboxMatcher = CHECKBOX_PATTERN.matcher(paragraphText);
         Matcher regularMatcher = PLACEHOLDER_PATTERN.matcher(paragraphText);
@@ -1620,48 +1681,83 @@ public class DocxTemplateService {
         boolean hasRegularPlaceholders = regularMatcher.find();
         boolean hasLoopItems = loopItemMatcher.find();
         
+        System.out.println("DEBUG: hasRadios=" + hasRadios + ", hasCheckboxes=" + hasCheckboxes + ", hasRegularPlaceholders=" + hasRegularPlaceholders + ", hasLoopItems=" + hasLoopItems);
+        
         if (!hasRadios && !hasCheckboxes && !hasRegularPlaceholders && !hasLoopItems) {
+            System.out.println("DEBUG: No placeholders found, returning");
             return;
         }
 
         Map<String, String> allReplacements = new HashMap<>();
 
         // Step 1: Process loop item placeholders using JSON-Path
-        if (hasLoopItems && originalJsonContext != null && itemsList != null) {
+        // Replace [i] with actual numeric index
+        if (hasLoopItems && originalJsonContext != null) {
+            System.out.println("DEBUG: Processing loop items, originalJsonContext is not null");
             loopItemMatcher.reset();
+            int matchCount = 0;
             while (loopItemMatcher.find()) {
+                matchCount++;
                 String arrayName = loopItemMatcher.group(1).trim();
                 String indexStr = loopItemMatcher.group(2).trim();
                 String property = loopItemMatcher.group(3).trim();
                 String fullPlaceholder = loopItemMatcher.group(0);
                 
+                System.out.println("DEBUG: Found loop item placeholder: " + fullPlaceholder + ", arrayName=" + arrayName + ", indexStr=" + indexStr + ", property=" + property);
+                
                 int targetIndex = -1;
                 if (indexStr.equalsIgnoreCase("i")) {
-                    if (loopArrayName != null && arrayName.equals(loopArrayName) && currentIndex >= 0) {
+                    System.out.println("DEBUG: indexStr is 'i', currentIndex=" + currentIndex);
+                    // Replace [i] with current loop index
+                    // Only require currentIndex >= 0, don't require array name match for table loops
+                    // (Table loops are simpler - one array per row)
+                    if (currentIndex >= 0) {
+                        // For table loops, we're always in the correct context
+                        // Replace [i] with the actual numeric index
                         targetIndex = currentIndex;
+                        System.out.println("DEBUG: Setting targetIndex to " + targetIndex);
                     } else {
+                        // Not in a loop context (currentIndex < 0), cannot replace [i]
+                        System.out.println("DEBUG: currentIndex < 0, skipping this placeholder");
                         continue;
                     }
                 } else {
+                    // Use the numeric index directly (e.g., [0], [1], [2])
                     try {
                         targetIndex = Integer.parseInt(indexStr);
+                        System.out.println("DEBUG: Parsed numeric index: " + targetIndex);
                     } catch (NumberFormatException e) {
+                        // Invalid index format, skip
+                        System.out.println("DEBUG: Invalid index format: " + indexStr);
                         continue;
                     }
                 }
                 
-                if (targetIndex < 0 || targetIndex >= itemsList.size()) {
-                    allReplacements.put(fullPlaceholder, "");
-                    continue;
+                // Validate index bounds if itemsList is provided
+                if (itemsList != null) {
+                    if (targetIndex < 0 || targetIndex >= itemsList.size()) {
+                        allReplacements.put(fullPlaceholder, "");
+                        continue;
+                    }
                 }
                 
                 // Use JSON-Path to extract value: $.arrayName[index].property
+                // Replace [i] with actual numeric index
                 String jsonPathExpr = "$." + arrayName + "[" + targetIndex + "]." + property;
+                System.out.println("DEBUG: Replacing [i] with " + targetIndex + ", JSON-Path: " + jsonPathExpr + ", Placeholder: " + fullPlaceholder);
+                
                 try {
                     Object value = originalJsonContext.read(jsonPathExpr);
                     String valueStr = value != null ? value.toString() : "";
                     allReplacements.put(fullPlaceholder, valueStr);
+                    System.out.println("DEBUG: Extracted value: " + valueStr + " for placeholder: " + fullPlaceholder);
                 } catch (PathNotFoundException e) {
+                    // Path not found
+                    System.out.println("DEBUG: Path not found: " + jsonPathExpr);
+                    allReplacements.put(fullPlaceholder, "");
+                } catch (Exception e) {
+                    // Any other error
+                    System.out.println("DEBUG: Error reading JSON-Path " + jsonPathExpr + ": " + e.getMessage());
                     allReplacements.put(fullPlaceholder, "");
                 }
             }
@@ -1766,6 +1862,476 @@ public class DocxTemplateService {
         
         // Otherwise, prepend $.
         return "$." + variablePath;
+    }
+
+    // ==================== Table Loop Implementation Methods ====================
+
+    /**
+     * Processes table row loops using JSON-Path
+     * Syntax: {{#loop:$arrayName}} in first cell, {{#/loop}} in last cell
+     * The entire row will be duplicated for each item in the array
+     * Use {{$arrayName[i].property}} in cells to access item properties
+     * 
+     * Example:
+     * | {{#loop:$orderItems}} | {{$orderItems[i].itemName}} | {{$orderItems[i].quantity}} | {{$orderItems[i].unitPrice}} {{#/loop}} |
+     */
+    private void processTableLoopsWithJsonPath(XWPFTable table, DocumentContext jsonContext) {
+        // Get a snapshot of rows to avoid concurrent modification issues
+        List<XWPFTableRow> rows = new ArrayList<>(table.getRows());
+        
+        // Process rows from end to start to avoid index shifting issues
+        for (int rowIndex = rows.size() - 1; rowIndex >= 0; rowIndex--) {
+            try {
+                XWPFTableRow row = rows.get(rowIndex);
+                if (row == null) {
+                    continue;
+                }
+                
+                // Check if this row contains both loop start and end markers
+                LoopMarkerInfo markerInfo = findLoopMarkersInRow(row);
+                if (markerInfo != null) {
+                    // Process this loop row
+                    processTableLoopRow(table, row, rowIndex, markerInfo, jsonContext);
+                }
+            } catch (IndexOutOfBoundsException e) {
+                // Row index out of bounds, skip this row
+                continue;
+            }
+        }
+    }
+
+    /**
+     * Information about loop markers in a table row
+     */
+    private static class LoopMarkerInfo {
+        String arrayName;
+        int startCellIndex;  // Cell index containing {{#loop:$arrayName}}
+        int endCellIndex;    // Cell index containing {{#/loop}}
+        
+        LoopMarkerInfo(String arrayName, int startCellIndex, int endCellIndex) {
+            this.arrayName = arrayName;
+            this.startCellIndex = startCellIndex;
+            this.endCellIndex = endCellIndex;
+        }
+    }
+
+    /**
+     * Finds loop markers {{#loop:$arrayName}} and {{#/loop}} in a table row
+     * Returns LoopMarkerInfo if both markers are found, null otherwise
+     */
+    private LoopMarkerInfo findLoopMarkersInRow(XWPFTableRow row) {
+        if (row == null) {
+            return null;
+        }
+        
+        String arrayName = null;
+        int startCellIndex = -1;
+        int endCellIndex = -1;
+        
+        List<XWPFTableCell> cells = row.getTableCells();
+        if (cells == null || cells.isEmpty()) {
+            return null;
+        }
+        
+        for (int cellIndex = 0; cellIndex < cells.size(); cellIndex++) {
+            try {
+                XWPFTableCell cell = cells.get(cellIndex);
+                if (cell == null) {
+                    continue;
+                }
+                
+                for (XWPFParagraph paragraph : cell.getParagraphs()) {
+                    if (paragraph == null) {
+                        continue;
+                    }
+                    
+                    String text = getParagraphText(paragraph);
+                    if (text != null) {
+                        // Check for loop start marker
+                        Matcher startMatcher = LOOP_START_PATTERN.matcher(text);
+                        if (startMatcher.find()) {
+                            String loopVariablePath = startMatcher.group(1);
+                            arrayName = extractVariableName(loopVariablePath);
+                            startCellIndex = cellIndex;
+                        }
+                        
+                        // Check for loop end marker
+                        Matcher endMatcher = LOOP_END_PATTERN.matcher(text);
+                        if (endMatcher.find()) {
+                            endCellIndex = cellIndex;
+                        }
+                    }
+                }
+            } catch (IndexOutOfBoundsException e) {
+                // Skip this cell if index is out of bounds
+                continue;
+            }
+        }
+        
+        // Both markers must be found and indices must be valid
+        if (arrayName != null && startCellIndex >= 0 && endCellIndex >= 0 
+            && startCellIndex < cells.size() && endCellIndex < cells.size()) {
+            return new LoopMarkerInfo(arrayName, startCellIndex, endCellIndex);
+        }
+        
+        return null;
+    }
+
+    /**
+     * Processes a single table loop row
+     * Duplicates the row for each item in the array and replaces placeholders
+     * Removes both loop markers after processing
+     */
+    @SuppressWarnings("unchecked")
+    private void processTableLoopRow(XWPFTable table, XWPFTableRow templateRow, int rowIndex, 
+                                     LoopMarkerInfo markerInfo, DocumentContext jsonContext) {
+        // Get the array from JSON using JSON-Path
+        String jsonPathExpr = "$." + markerInfo.arrayName;
+        Object listObj;
+        try {
+            listObj = jsonContext.read(jsonPathExpr);
+        } catch (PathNotFoundException e) {
+            // Array not found, remove the loop markers and return
+            removeLoopMarkersFromRow(templateRow, markerInfo);
+            return;
+        }
+        
+        if (!(listObj instanceof List)) {
+            // Not a list, remove the loop markers and return
+            removeLoopMarkersFromRow(templateRow, markerInfo);
+            return;
+        }
+        
+        List<Object> items = (List<Object>) listObj;
+        if (items.isEmpty()) {
+            // Empty list, remove the template row entirely
+            // Verify the row index is still valid before removing
+            List<XWPFTableRow> currentRows = table.getRows();
+            if (rowIndex >= 0 && rowIndex < currentRows.size()) {
+                try {
+                    table.removeRow(rowIndex);
+                } catch (IndexOutOfBoundsException e) {
+                    // Row index invalid, skip removal
+                }
+            }
+            return;
+        }
+        
+        // Step 1: Clone the template row XML BEFORE any modifications (preserve original structure)
+        String templateRowXml = templateRow.getCtRow().xmlText();
+        
+        // Step 2: Process the template row for the first item (index 0)
+        // This will: 1) Remove loop markers, 2) Replace [i] with 0, 3) Extract values
+        processTableRowForItem(templateRow, jsonContext, markerInfo.arrayName, 0, jsonContext, items, markerInfo);
+        
+        // Step 3: Insert additional rows for remaining items (if any)
+        if (items.size() > 1) {
+            System.out.println("DEBUG: Starting to clone rows for " + (items.size() - 1) + " additional items");
+            // Start inserting after the template row (which is now at rowIndex after processing)
+            int insertPosition = rowIndex + 1;
+            
+            for (int itemIndex = 1; itemIndex < items.size(); itemIndex++) {
+                System.out.println("DEBUG: Processing item index " + itemIndex + ", insertPosition=" + insertPosition);
+                try {
+                    // Clone the original template row XML (with markers and placeholders)
+                    org.openxmlformats.schemas.wordprocessingml.x2006.main.CTRow clonedRowCT =
+                        org.openxmlformats.schemas.wordprocessingml.x2006.main.CTRow.Factory.parse(templateRowXml);
+                    
+                    System.out.println("DEBUG: Successfully parsed cloned row XML");
+                    
+                    // Get current table size before insertion
+                    int currentTableSize = table.getCTTbl().sizeOfTrArray();
+                    System.out.println("DEBUG: Current table size: " + currentTableSize);
+                    
+                    // Validate insert position
+                    if (insertPosition > currentTableSize) {
+                        System.out.println("DEBUG: Adjusting insertPosition from " + insertPosition + " to " + currentTableSize);
+                        insertPosition = currentTableSize;
+                    }
+                    if (insertPosition < 0) {
+                        System.out.println("DEBUG: Adjusting insertPosition from " + insertPosition + " to 0");
+                        insertPosition = 0;
+                    }
+                    
+                    System.out.println("DEBUG: Final insertPosition: " + insertPosition);
+                    
+                    // Insert a new empty row at the specified position
+                    table.getCTTbl().insertNewTr(insertPosition);
+                    System.out.println("DEBUG: Inserted new empty row at position " + insertPosition);
+                    
+                    // Replace the empty row with our cloned row content
+                    table.getCTTbl().setTrArray(insertPosition, clonedRowCT);
+                    System.out.println("DEBUG: Set cloned row content at position " + insertPosition);
+                    
+                    // Get the CTRow we just set (similar to how paragraphs are handled)
+                    org.openxmlformats.schemas.wordprocessingml.x2006.main.CTRow rowCT = table.getCTTbl().getTrArray(insertPosition);
+                    if (rowCT == null) {
+                        System.out.println("DEBUG: ERROR - Could not get CTRow at position " + insertPosition);
+                        insertPosition++;
+                        continue;
+                    }
+                    
+                    System.out.println("DEBUG: Retrieved CTRow at position " + insertPosition);
+                    
+                    // Create XWPFTableRow wrapper from the CTRow (similar to XWPFParagraph wrapper)
+                    XWPFTableRow newRow = new XWPFTableRow(rowCT, table);
+                    System.out.println("DEBUG: Created XWPFTableRow wrapper");
+                    
+                    // Process the new row for this item: remove markers, replace [i], extract values
+                    System.out.println("DEBUG: Calling processTableRowForItem for itemIndex=" + itemIndex);
+                    processTableRowForItem(newRow, jsonContext, markerInfo.arrayName, itemIndex, jsonContext, items, markerInfo);
+                    System.out.println("DEBUG: Completed processTableRowForItem for itemIndex=" + itemIndex);
+                    
+                    // Move to next position for next iteration
+                    insertPosition++;
+                    System.out.println("DEBUG: Incremented insertPosition to " + insertPosition);
+                    
+                } catch (org.apache.xmlbeans.XmlException e) {
+                    // If cloning/parsing fails, skip this item
+                    System.out.println("DEBUG: XmlException while cloning row: " + e.getMessage());
+                    e.printStackTrace();
+                    continue;
+                } catch (IndexOutOfBoundsException e) {
+                    // If row access fails, skip this item
+                    System.out.println("DEBUG: IndexOutOfBoundsException while accessing row: " + e.getMessage());
+                    e.printStackTrace();
+                    continue;
+                } catch (Exception e) {
+                    // Catch any other exceptions
+                    System.out.println("DEBUG: Exception while processing row clone: " + e.getMessage());
+                    e.printStackTrace();
+                    continue;
+                }
+            }
+            System.out.println("DEBUG: Finished cloning all additional rows");
+        }
+    }
+
+    /**
+     * Processes a table row for a specific item in the loop
+     * 1. Removes loop markers ({{#loop:$arrayName}} and {{#/loop}})
+     * 2. Replaces [i] with the actual numeric index
+     * 3. Extracts and replaces all placeholders with values from JSON
+     */
+    private void processTableRowForItem(XWPFTableRow row, DocumentContext jsonContext,
+                                        String loopArrayName, int currentIndex,
+                                        DocumentContext originalJsonContext, 
+                                        List<Object> itemsList,
+                                        LoopMarkerInfo markerInfo) {
+        if (row == null) {
+            return;
+        }
+        
+        List<XWPFTableCell> cells = row.getTableCells();
+        if (cells == null || cells.isEmpty()) {
+            return;
+        }
+        
+        // Debug: Log that we're processing this row
+        System.out.println("DEBUG: Processing table row for item index " + currentIndex + ", array: " + loopArrayName);
+        
+        // Process each cell: remove markers AND process placeholders in one pass
+        // This ensures placeholders are processed immediately after marker removal
+        for (XWPFTableCell cell : cells) {
+            if (cell == null) {
+                continue;
+            }
+            
+            try {
+                List<XWPFParagraph> paragraphs = cell.getParagraphs();
+                if (paragraphs == null || paragraphs.isEmpty()) {
+                    // If no paragraphs, try to get text directly from cell
+                    String cellText = cell.getText();
+                    if (cellText != null && (LOOP_START_PATTERN.matcher(cellText).find() || LOOP_END_PATTERN.matcher(cellText).find())) {
+                        // Create a paragraph to process
+                        XWPFParagraph para = cell.addParagraph();
+                        XWPFRun run = para.createRun();
+                        run.setText(cellText);
+                        // Remove markers first
+                        removePlaceholderFromParagraph(para, LOOP_START_PATTERN);
+                        removePlaceholderFromParagraph(para, LOOP_END_PATTERN);
+                        // Then process placeholders
+                        processAllPlaceholdersWithJsonPath(para, jsonContext, loopArrayName, currentIndex, 
+                                                          originalJsonContext, itemsList);
+                    }
+                    continue;
+                }
+                
+                for (XWPFParagraph paragraph : paragraphs) {
+                    if (paragraph == null) {
+                        continue;
+                    }
+                    
+                    String textBefore = getParagraphText(paragraph);
+                    if (textBefore == null || textBefore.trim().isEmpty()) {
+                        continue;
+                    }
+                    
+                    // Debug: Log text before processing
+                    System.out.println("DEBUG: Cell text before processing: " + textBefore);
+                    
+                    // Step 1: Remove loop markers (but preserve other text including placeholders)
+                    removePlaceholderFromParagraph(paragraph, LOOP_START_PATTERN);
+                    removePlaceholderFromParagraph(paragraph, LOOP_END_PATTERN);
+                    
+                    // Double-check: if markers still exist, remove them more aggressively
+                    String textAfterMarkers = getParagraphText(paragraph);
+                    if (textAfterMarkers != null) {
+                        boolean hasStartMarker = LOOP_START_PATTERN.matcher(textAfterMarkers).find();
+                        boolean hasEndMarker = LOOP_END_PATTERN.matcher(textAfterMarkers).find();
+                        
+                        if (hasStartMarker || hasEndMarker) {
+                            // More aggressive removal - replace all markers directly
+                            String cleaned = textAfterMarkers;
+                            cleaned = LOOP_START_PATTERN.matcher(cleaned).replaceAll("");
+                            cleaned = LOOP_END_PATTERN.matcher(cleaned).replaceAll("");
+                            cleaned = cleaned.trim();
+                            
+                            if (!cleaned.equals(textAfterMarkers)) {
+                                // Clear and recreate
+                                int runsCount = paragraph.getRuns().size();
+                                for (int i = runsCount - 1; i >= 0; i--) {
+                                    paragraph.removeRun(i);
+                                }
+                                if (!cleaned.isEmpty()) {
+                                    paragraph.createRun().setText(cleaned);
+                                }
+                                System.out.println("DEBUG: Aggressively removed markers, new text: " + cleaned);
+                            }
+                        }
+                    }
+                    
+                    // Step 2: Process placeholders (replaces [i] with currentIndex and extracts values)
+                    // IMPORTANT: This must happen AFTER marker removal to ensure placeholders are still in the text
+                    String textBeforePlaceholders = getParagraphText(paragraph);
+                    System.out.println("DEBUG: Text before placeholder processing: " + textBeforePlaceholders);
+                    
+                    if (textBeforePlaceholders != null && !textBeforePlaceholders.trim().isEmpty()) {
+                        // Process all placeholders in this paragraph
+                        // IMPORTANT: Pass loopArrayName, currentIndex, and itemsList
+                        // This allows processAllPlaceholdersWithJsonPath to replace [i] with currentIndex
+                        processAllPlaceholdersWithJsonPath(paragraph, jsonContext, loopArrayName, currentIndex, 
+                                                          originalJsonContext, itemsList);
+                        
+                        // Debug: Log paragraph text after processing
+                        String textAfterPlaceholders = getParagraphText(paragraph);
+                        System.out.println("DEBUG: Text after placeholder processing: " + textAfterPlaceholders);
+                    }
+                }
+            } catch (Exception e) {
+                System.out.println("DEBUG: Exception processing cell: " + e.getMessage());
+                e.printStackTrace();
+                continue;
+            }
+        }
+    }
+
+    /**
+     * Removes both loop markers {{#loop:$arrayName}} and {{#/loop}} from a table row
+     * This ensures the loop markers don't appear in the final document
+     * Searches ALL cells to find and remove markers (not just start/end cells)
+     */
+    private void removeLoopMarkersFromRow(XWPFTableRow row, LoopMarkerInfo markerInfo) {
+        if (row == null) {
+            return;
+        }
+        
+        List<XWPFTableCell> cells = row.getTableCells();
+        if (cells == null || cells.isEmpty()) {
+            return;
+        }
+        
+        // Search ALL cells for loop markers and remove them
+        // This ensures markers are removed even if cell structure changes after cloning
+        for (XWPFTableCell cell : cells) {
+            if (cell == null) {
+                continue;
+            }
+            
+            try {
+                List<XWPFParagraph> paragraphs = cell.getParagraphs();
+                if (paragraphs == null || paragraphs.isEmpty()) {
+                    continue;
+                }
+                
+                for (XWPFParagraph paragraph : paragraphs) {
+                    if (paragraph != null) {
+                        // Remove loop start marker if found
+                        removePlaceholderFromParagraph(paragraph, LOOP_START_PATTERN);
+                        // Remove loop end marker if found
+                        removePlaceholderFromParagraph(paragraph, LOOP_END_PATTERN);
+                    }
+                }
+            } catch (Exception e) {
+                // If processing a cell fails, continue with next cell
+                continue;
+            }
+        }
+    }
+
+    /**
+     * Processes placeholders in a table row using JSON-Path
+     * Handles loop item placeholders like {{$arrayName[i].property}}
+     * Replaces [i] with the actual numeric index (0, 1, 2, etc.)
+     */
+    private void processTableRowPlaceholdersWithJsonPath(XWPFTableRow row, DocumentContext jsonContext,
+                                                          String loopArrayName, int currentIndex,
+                                                          DocumentContext originalJsonContext, 
+                                                          List<Object> itemsList) {
+        if (row == null) {
+            return;
+        }
+        
+        try {
+            List<XWPFTableCell> cells = row.getTableCells();
+            if (cells == null || cells.isEmpty()) {
+                return;
+            }
+            
+            // Process each cell in the row
+            for (XWPFTableCell cell : cells) {
+                if (cell == null) {
+                    continue;
+                }
+                
+                try {
+                    List<XWPFParagraph> paragraphs = cell.getParagraphs();
+                    if (paragraphs == null || paragraphs.isEmpty()) {
+                        // If no paragraphs, the cell might be empty - continue to next cell
+                        continue;
+                    }
+                    
+                    // Process each paragraph in the cell
+                for (XWPFParagraph paragraph : paragraphs) {
+                    if (paragraph != null) {
+                        String paraText = getParagraphText(paragraph);
+                        if (paraText != null && !paraText.trim().isEmpty()) {
+                            // Debug: Log paragraph text before processing
+                            System.out.println("DEBUG: Processing paragraph text: " + paraText);
+                            
+                            // Process all placeholders in this paragraph
+                            // IMPORTANT: Pass loopArrayName, currentIndex, and itemsList
+                            // This allows processAllPlaceholdersWithJsonPath to replace [i] with currentIndex
+                            processAllPlaceholdersWithJsonPath(paragraph, jsonContext, loopArrayName, currentIndex, 
+                                                              originalJsonContext, itemsList);
+                            
+                            // Debug: Log paragraph text after processing
+                            String paraTextAfter = getParagraphText(paragraph);
+                            System.out.println("DEBUG: After processing: " + paraTextAfter);
+                        }
+                    }
+                }
+                } catch (Exception e) {
+                    // If processing a cell fails, continue with next cell
+                    // Don't let one cell failure stop the entire row processing
+                    continue;
+                }
+            }
+        } catch (Exception e) {
+            // If processing the row fails, log and continue
+            // Don't throw - just skip this row to avoid breaking the entire document processing
+            System.err.println("Error in processTableRowPlaceholdersWithJsonPath: " + e.getMessage());
+        }
     }
 }
 
