@@ -146,25 +146,7 @@ public class DocumentController {
             return ResponseEntity.badRequest().body(("Failed to call external API: " + e.getMessage()).getBytes());
         }
 
-        // Step 2: Parse JSON String using JSON-Path to extract field paths
-        Map<String, Object> variables = new HashMap<>();
-        try {
-            // Parse JSON document using JSON-Path
-            com.jayway.jsonpath.DocumentContext jsonContext = JsonPath.parse(jsonResponse);
-            
-            // Extract all fields from root level and nested levels
-            // This will flatten the JSON structure for template variable access
-            Object document = jsonContext.json();
-            extractJsonPaths(document, "", variables);
-            
-            // Also add support for direct JSON-Path queries
-            // Users can access values using JSON-Path expressions in templates
-            // For example: {{$orderId}} or {{$customer.name}} or {{$items[0].name}}
-        } catch (Exception e) {
-            return ResponseEntity.badRequest().body(("Failed to parse JSON response with JSON-Path: " + e.getMessage()).getBytes());
-        }
-
-        // Step 3: Get template input stream
+        // Step 2: Get template input stream
         InputStream templateInputStream;
         
         if (file != null && !file.isEmpty()) {
@@ -181,11 +163,17 @@ public class DocumentController {
             return ResponseEntity.badRequest().body("Either 'template' parameter or 'file' must be provided".getBytes());
         }
 
-        // Step 4: Generate document using the parsed JSON data
-        byte[] processedDocument = docxTemplateService.processTemplatePreservingFormat(
-                templateInputStream, 
-                variables
-        );
+        // Step 3: Generate document using JSON-Path to extract values directly from JSON
+        // Placeholders like {{$orderId}} or {{$customer.name}} will use JSON-Path expressions
+        byte[] processedDocument;
+        try {
+            processedDocument = docxTemplateService.processTemplateWithJsonPath(
+                    templateInputStream, 
+                    jsonResponse
+            );
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(("Failed to process template with JSON-Path: " + e.getMessage()).getBytes());
+        }
 
         // Save to a file in the local filesystem
         String fileName = UUID.randomUUID().toString() + ".docx";

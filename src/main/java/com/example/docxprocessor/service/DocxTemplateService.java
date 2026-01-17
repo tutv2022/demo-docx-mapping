@@ -1,5 +1,8 @@
 package com.example.docxprocessor.service;
 
+import com.jayway.jsonpath.DocumentContext;
+import com.jayway.jsonpath.JsonPath;
+import com.jayway.jsonpath.PathNotFoundException;
 import org.apache.poi.xwpf.usermodel.*;
 import org.springframework.stereotype.Service;
 
@@ -65,6 +68,66 @@ public class DocxTemplateService {
             for (XWPFFooter footer : document.getFooterList()) {
                 for (XWPFParagraph paragraph : footer.getParagraphs()) {
                     processAllPlaceholders(paragraph, data, null, -1, data, null);
+                }
+            }
+
+            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+            document.write(outputStream);
+            return outputStream.toByteArray();
+        }
+    }
+
+    /**
+     * Processes a DOCX template file using JSON-Path expressions to extract values from JSON
+     * Placeholders like {{$orderId}} or {{$customer.name}} will use JSON-Path to extract values directly
+     * 
+     * @param templateInputStream Input stream of the template DOCX file
+     * @param jsonString JSON string to extract values from using JSON-Path
+     * @return Byte array of the processed DOCX file
+     * @throws IOException if file processing fails
+     */
+    public byte[] processTemplateWithJsonPath(InputStream templateInputStream, String jsonString) throws IOException {
+        DocumentContext jsonContext = JsonPath.parse(jsonString);
+        return processTemplateWithJsonPath(templateInputStream, jsonContext);
+    }
+
+    /**
+     * Processes a DOCX template file using JSON-Path DocumentContext
+     * Uses JSON-Path expressions directly when replacing placeholders
+     */
+    public byte[] processTemplateWithJsonPath(InputStream templateInputStream, DocumentContext jsonContext) throws IOException {
+        try (XWPFDocument document = new XWPFDocument(templateInputStream)) {
+            
+            // Step 1: Process loops first (they can contain placeholders)
+            processLoopsWithJsonPath(document, jsonContext);
+            
+            // Step 2: Process paragraphs - unified processing for checkboxes and regular placeholders
+            for (XWPFParagraph paragraph : document.getParagraphs()) {
+                processAllPlaceholdersWithJsonPath(paragraph, jsonContext, null, -1, jsonContext, null);
+            }
+
+            // Process tables
+            for (XWPFTable table : document.getTables()) {
+                for (XWPFTableRow row : table.getRows()) {
+                    for (XWPFTableCell cell : row.getTableCells()) {
+                        for (XWPFParagraph paragraph : cell.getParagraphs()) {
+                            processAllPlaceholdersWithJsonPath(paragraph, jsonContext, null, -1, jsonContext, null);
+                        }
+                    }
+                }
+            }
+
+            // Process headers
+            for (XWPFHeader header : document.getHeaderList()) {
+                for (XWPFParagraph paragraph : header.getParagraphs()) {
+                    processAllPlaceholdersWithJsonPath(paragraph, jsonContext, null, -1, jsonContext, null);
+                }
+            }
+
+            // Process footers
+            for (XWPFFooter footer : document.getFooterList()) {
+                for (XWPFParagraph paragraph : footer.getParagraphs()) {
+                    processAllPlaceholdersWithJsonPath(paragraph, jsonContext, null, -1, jsonContext, null);
                 }
             }
 
@@ -1360,6 +1423,349 @@ public class DocxTemplateService {
             // Return null if extraction fails
         }
         return null;
+    }
+
+    // ==================== JSON-Path Implementation Methods ====================
+
+    /**
+     * Processes loop blocks in the document using JSON-Path
+     * New syntax: {{#loop:$arrayName}} ... content ... {{#/loop}}
+     * Within loops, use {{$arrayName[i].property}} to access item properties
+     */
+    private void processLoopsWithJsonPath(XWPFDocument document, DocumentContext jsonContext) {
+        List<XWPFParagraph> paragraphs = new ArrayList<>(document.getParagraphs());
+        
+        if (paragraphs.isEmpty()) {
+            return;
+        }
+        
+        int maxIterations = 100;
+        int iteration = 0;
+        
+        while (iteration < maxIterations) {
+            iteration++;
+            boolean foundLoop = false;
+            
+            for (int i = paragraphs.size() - 1; i >= 0; i--) {
+                XWPFParagraph paragraph = paragraphs.get(i);
+                if (paragraph == null) {
+                    continue;
+                }
+                
+                String text = getParagraphText(paragraph);
+                Matcher endMatcher = LOOP_END_PATTERN.matcher(text);
+                if (endMatcher.find()) {
+                    int startIndex = findLoopStartMarker(paragraphs, i);
+                    if (startIndex != -1 && startIndex < i) {
+                        processLoopBlockWithJsonPath(document, paragraphs, startIndex, i, jsonContext);
+                        foundLoop = true;
+                        paragraphs = new ArrayList<>(document.getParagraphs());
+                        break;
+                    }
+                }
+            }
+            
+            if (!foundLoop) {
+                break;
+            }
+        }
+    }
+
+    /**
+     * Processes a single loop block using JSON-Path
+     */
+    @SuppressWarnings("unchecked")
+    private void processLoopBlockWithJsonPath(XWPFDocument document, List<XWPFParagraph> paragraphs, 
+                                              int startIndex, int endIndex, DocumentContext jsonContext) {
+        XWPFParagraph startPara = paragraphs.get(startIndex);
+        String startText = getParagraphText(startPara);
+        
+        Matcher startMatcher = LOOP_START_PATTERN.matcher(startText);
+        if (!startMatcher.find()) {
+            return;
+        }
+        
+        String loopVariablePath = startMatcher.group(1);
+        String loopVariable = extractVariableName(loopVariablePath);
+        
+        // Use JSON-Path to get the list
+        String jsonPathExpr = "$." + loopVariable;
+        Object listObj;
+        try {
+            listObj = jsonContext.read(jsonPathExpr);
+        } catch (PathNotFoundException e) {
+            removeLoopMarkers(paragraphs, startIndex, endIndex);
+            return;
+        }
+        
+        if (!(listObj instanceof List)) {
+            removeLoopMarkers(paragraphs, startIndex, endIndex);
+            return;
+        }
+        
+        List<Object> items = (List<Object>) listObj;
+        if (items.isEmpty()) {
+            removeLoopBlock(paragraphs, startIndex, endIndex);
+            return;
+        }
+        
+        // Extract content between markers
+        List<XWPFParagraph> loopContent = new ArrayList<>();
+        for (int i = startIndex + 1; i < endIndex; i++) {
+            loopContent.add(paragraphs.get(i));
+        }
+        
+        List<String> loopContentXml = new ArrayList<>();
+        for (XWPFParagraph para : loopContent) {
+            String paraXml = para.getCTP().xmlText();
+            loopContentXml.add(paraXml);
+        }
+        
+        removePlaceholderFromParagraph(startPara, LOOP_START_PATTERN);
+        XWPFParagraph endPara = paragraphs.get(endIndex);
+        removePlaceholderFromParagraph(endPara, LOOP_END_PATTERN);
+        
+        org.openxmlformats.schemas.wordprocessingml.x2006.main.CTBody body = document.getDocument().getBody();
+        org.openxmlformats.schemas.wordprocessingml.x2006.main.CTP startParaCT = startPara.getCTP();
+        
+        int startParaIndex = -1;
+        String startParaXml = startParaCT.xmlText();
+        for (int i = 0; i < body.sizeOfPArray(); i++) {
+            if (body.getPArray(i).xmlText().equals(startParaXml)) {
+                startParaIndex = i;
+                break;
+            }
+        }
+        
+        if (startParaIndex == -1) {
+            return;
+        }
+        
+        int endParaIndex = -1;
+        String endParaXml = endPara.getCTP().xmlText();
+        for (int i = 0; i < body.sizeOfPArray(); i++) {
+            if (body.getPArray(i).xmlText().equals(endParaXml)) {
+                endParaIndex = i;
+                break;
+            }
+        }
+        
+        if (endParaIndex == -1 || endParaIndex <= startParaIndex) {
+            return;
+        }
+        
+        body.removeP(endParaIndex);
+        for (int i = endParaIndex - 1; i > startParaIndex; i--) {
+            body.removeP(i);
+        }
+        
+        int currentInsertPos = startParaIndex + 1;
+        
+        for (int itemIndex = 0; itemIndex < items.size(); itemIndex++) {
+            Object item = items.get(itemIndex);
+            
+            for (String paraXml : loopContentXml) {
+                org.openxmlformats.schemas.wordprocessingml.x2006.main.CTP clonedCT;
+                try {
+                    clonedCT = org.openxmlformats.schemas.wordprocessingml.x2006.main.CTP.Factory.parse(paraXml);
+                } catch (org.apache.xmlbeans.XmlException e) {
+                    continue;
+                }
+                
+                body.insertNewP(currentInsertPos);
+                body.setPArray(currentInsertPos, clonedCT);
+                
+                org.openxmlformats.schemas.wordprocessingml.x2006.main.CTP newParaCT = body.getPArray(currentInsertPos);
+                XWPFParagraph newPara = new XWPFParagraph(newParaCT, document);
+                
+                if (!newPara.getRuns().isEmpty()) {
+                    // For loop items, we use the original context and access items by index
+                    // The placeholder {{$arrayName[i].property}} will be resolved using the original context
+                    processAllPlaceholdersWithJsonPath(newPara, jsonContext, loopVariable, itemIndex, jsonContext, items);
+                } else {
+                    String paraText = getParagraphText(newPara);
+                    if (paraText != null && !paraText.trim().isEmpty()) {
+                        XWPFRun run = newPara.createRun();
+                        run.setText(paraText);
+                        processAllPlaceholdersWithJsonPath(newPara, jsonContext, loopVariable, itemIndex, jsonContext, items);
+                    }
+                }
+                
+                currentInsertPos++;
+            }
+        }
+    }
+
+    /**
+     * Process placeholders using JSON-Path expressions directly
+     * Extracts values directly from JSON using JSON-Path when replacing placeholders
+     */
+    private void processAllPlaceholdersWithJsonPath(XWPFParagraph paragraph, DocumentContext jsonContext, 
+                                                     String loopArrayName, int currentIndex, 
+                                                     DocumentContext originalJsonContext, 
+                                                     List<Object> itemsList) {
+        if (paragraph.getRuns().isEmpty()) {
+            return;
+        }
+
+        String paragraphText = getParagraphText(paragraph);
+        
+        Matcher radioMatcher = RADIO_PATTERN.matcher(paragraphText);
+        Matcher checkboxMatcher = CHECKBOX_PATTERN.matcher(paragraphText);
+        Matcher regularMatcher = PLACEHOLDER_PATTERN.matcher(paragraphText);
+        Matcher loopItemMatcher = LOOP_ITEM_PATTERN.matcher(paragraphText);
+        
+        boolean hasRadios = radioMatcher.find();
+        boolean hasCheckboxes = checkboxMatcher.find();
+        boolean hasRegularPlaceholders = regularMatcher.find();
+        boolean hasLoopItems = loopItemMatcher.find();
+        
+        if (!hasRadios && !hasCheckboxes && !hasRegularPlaceholders && !hasLoopItems) {
+            return;
+        }
+
+        Map<String, String> allReplacements = new HashMap<>();
+
+        // Step 1: Process loop item placeholders using JSON-Path
+        if (hasLoopItems && originalJsonContext != null && itemsList != null) {
+            loopItemMatcher.reset();
+            while (loopItemMatcher.find()) {
+                String arrayName = loopItemMatcher.group(1).trim();
+                String indexStr = loopItemMatcher.group(2).trim();
+                String property = loopItemMatcher.group(3).trim();
+                String fullPlaceholder = loopItemMatcher.group(0);
+                
+                int targetIndex = -1;
+                if (indexStr.equalsIgnoreCase("i")) {
+                    if (loopArrayName != null && arrayName.equals(loopArrayName) && currentIndex >= 0) {
+                        targetIndex = currentIndex;
+                    } else {
+                        continue;
+                    }
+                } else {
+                    try {
+                        targetIndex = Integer.parseInt(indexStr);
+                    } catch (NumberFormatException e) {
+                        continue;
+                    }
+                }
+                
+                if (targetIndex < 0 || targetIndex >= itemsList.size()) {
+                    allReplacements.put(fullPlaceholder, "");
+                    continue;
+                }
+                
+                // Use JSON-Path to extract value: $.arrayName[index].property
+                String jsonPathExpr = "$." + arrayName + "[" + targetIndex + "]." + property;
+                try {
+                    Object value = originalJsonContext.read(jsonPathExpr);
+                    String valueStr = value != null ? value.toString() : "";
+                    allReplacements.put(fullPlaceholder, valueStr);
+                } catch (PathNotFoundException e) {
+                    allReplacements.put(fullPlaceholder, "");
+                }
+            }
+        }
+
+        // Step 2: Process radio buttons using JSON-Path
+        if (hasRadios) {
+            radioMatcher.reset();
+            while (radioMatcher.find()) {
+                String radioGroupPath = radioMatcher.group(1);
+                String radioValue = radioMatcher.group(2);
+                String fullPlaceholder = radioMatcher.group(0);
+                
+                String radioGroup = extractVariableName(radioGroupPath);
+                String jsonPathExpr = "$." + radioGroup;
+                try {
+                    Object groupValueObj = jsonContext.read(jsonPathExpr);
+                    String groupValue = groupValueObj != null ? groupValueObj.toString() : null;
+                    boolean isSelected = radioValue.equalsIgnoreCase(groupValue);
+                    String radioSymbol = isSelected ? "◉" : "○";
+                    allReplacements.put(fullPlaceholder, radioSymbol);
+                } catch (PathNotFoundException e) {
+                    allReplacements.put(fullPlaceholder, "○");
+                }
+            }
+        }
+
+        // Step 3: Process checkboxes using JSON-Path
+        if (hasCheckboxes) {
+            checkboxMatcher.reset();
+            while (checkboxMatcher.find()) {
+                String checkboxGroupPath = checkboxMatcher.group(1);
+                String checkboxValue = checkboxMatcher.group(2);
+                String fullPlaceholder = checkboxMatcher.group(0);
+                
+                String checkboxGroup = extractVariableName(checkboxGroupPath);
+                String jsonPathExpr = "$." + checkboxGroup;
+                try {
+                    Object groupValueObj = jsonContext.read(jsonPathExpr);
+                    String groupValue = groupValueObj != null ? groupValueObj.toString() : null;
+                    boolean isChecked = checkboxValue.equalsIgnoreCase(groupValue);
+                    String checkboxSymbol = isChecked ? "☒" : "☐";
+                    allReplacements.put(fullPlaceholder, checkboxSymbol);
+                } catch (PathNotFoundException e) {
+                    allReplacements.put(fullPlaceholder, "☐");
+                }
+            }
+        }
+
+        // Step 4: Process regular placeholders using JSON-Path
+        if (hasRegularPlaceholders) {
+            regularMatcher.reset();
+            while (regularMatcher.find()) {
+                String variablePath = regularMatcher.group(1);
+                String fullPlaceholder = regularMatcher.group(0);
+
+                // Skip if this placeholder contains [i] or [number] - it's a loop item placeholder
+                if (fullPlaceholder.matches(".*\\[([i]|\\d+)\\].*")) {
+                    continue;
+                }
+                
+                if (allReplacements.containsKey(fullPlaceholder)) {
+                    continue;
+                }
+
+                // Convert variable path to JSON-Path expression
+                // e.g., "$orderId" -> "$.orderId", "$customer.name" -> "$.customer.name"
+                String variableName = extractVariableName(variablePath);
+                String jsonPathExpr = convertToJsonPath(variableName);
+                
+                try {
+                    Object valueObj = jsonContext.read(jsonPathExpr);
+                    String value = valueObj != null ? valueObj.toString() : "";
+                    allReplacements.put(fullPlaceholder, value);
+                } catch (PathNotFoundException e) {
+                    allReplacements.put(fullPlaceholder, "");
+                }
+            }
+        }
+
+        if (!allReplacements.isEmpty()) {
+            processRunsWithPlaceholderFormatting(paragraph, allReplacements, currentIndex);
+        }
+    }
+
+    /**
+     * Converts a variable path to JSON-Path expression
+     * Examples:
+     *   "orderId" -> "$.orderId"
+     *   "customer.name" -> "$.customer.name"
+     *   "items[0].name" -> "$.items[0].name"
+     */
+    private String convertToJsonPath(String variablePath) {
+        if (variablePath == null || variablePath.isEmpty()) {
+            return "$";
+        }
+        
+        // If it already starts with $, return as is
+        if (variablePath.startsWith("$")) {
+            return variablePath;
+        }
+        
+        // Otherwise, prepend $.
+        return "$." + variablePath;
     }
 }
 
