@@ -1,7 +1,7 @@
 package com.example.docxprocessor.controller;
 
 import com.example.docxprocessor.model.TemplateData;
-import com.example.docxprocessor.service.DocxTemplateService;
+import com.example.docxprocessor.service.Docx4jTemplateService;
 import com.jayway.jsonpath.JsonPath;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.io.ClassPathResource;
@@ -24,7 +24,7 @@ import java.util.UUID;
 public class DocumentController {
 
     @Autowired
-    private DocxTemplateService docxTemplateService;
+    private Docx4jTemplateService docxTemplateService;
 
     @Autowired
     private RestTemplate restTemplate;

@@ -20,7 +20,7 @@
 
     <properties>
         <java.version>17</java.version>
-        <poi.version>5.2.5</poi.version>
+        <docx4j.version>11.5.0</docx4j.version>
     </properties>
 
     <dependencies>
@@ -30,11 +30,16 @@
             <artifactId>spring-boot-starter-web</artifactId>
         </dependency>
 
-        <!-- Apache POI for DOCX processing -->
+        <!-- docx4j for DOCX processing (Jakarta / Spring Boot 3 compatible) -->
         <dependency>
-            <groupId>org.apache.poi</groupId>
-            <artifactId>poi-ooxml</artifactId>
-            <version>${poi.version}</version>
+            <groupId>org.docx4j</groupId>
+            <artifactId>docx4j-core</artifactId>
+            <version>${docx4j.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.docx4j</groupId>
+            <artifactId>docx4j-JAXB-ReferenceImpl</artifactId>
+            <version>${docx4j.version}</version>
         </dependency>
 
         <!-- JSON-Path for JSON field extraction -->
