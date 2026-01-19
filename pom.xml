@@ -41,6 +41,12 @@
             <artifactId>docx4j-JAXB-ReferenceImpl</artifactId>
             <version>${docx4j.version}</version>
         </dependency>
+        <!-- docx4j PDF export via XSL-FO (Apache FOP) -->
+        <dependency>
+            <groupId>org.docx4j</groupId>
+            <artifactId>docx4j-export-fo</artifactId>
+            <version>${docx4j.version}</version>
+        </dependency>
 
         <!-- JSON-Path for JSON field extraction -->
         <dependency>

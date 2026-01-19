@@ -193,6 +193,84 @@ public class DocumentController {
     }
 
     /**
+     * Generate PDF document from external API data.
+     * Same as /generate-from-api but exports PDF.
+     */
+    @PostMapping("/generate-pdf-from-api")
+    public ResponseEntity<byte[]> generatePdfFromApi(
+            @RequestParam(value = "template", required = false) String templateName,
+            @RequestParam(value = "file", required = false) MultipartFile file,
+            @RequestParam(value = "apiUrl", required = false, defaultValue = "http://localhost:8011/api/order") String apiUrl,
+            @RequestParam(value = "method", required = false, defaultValue = "GET") String method,
+            @RequestParam(value = "token", required = false) String jwtToken,
+            @RequestParam(value = "requestBody", required = false) String requestBodyJson,
+            @RequestHeader(value = "Authorization", required = false) String authorizationHeader) throws IOException {
+
+        String token = extractJwtToken(authorizationHeader, jwtToken);
+
+        Map<String, Object> requestBody = null;
+        if (requestBodyJson != null && !requestBodyJson.isEmpty()) {
+            try {
+                com.jayway.jsonpath.DocumentContext bodyContext = JsonPath.parse(requestBodyJson);
+                Object bodyObj = bodyContext.json();
+                if (bodyObj instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> bodyMap = (Map<String, Object>) bodyObj;
+                    requestBody = bodyMap;
+                }
+            } catch (Exception e) {
+                return ResponseEntity.badRequest().body(("Invalid request body JSON: " + e.getMessage()).getBytes());
+            }
+        }
+
+        String jsonResponse;
+        try {
+            jsonResponse = callExternalApi(apiUrl, method, token, requestBody);
+            if (jsonResponse == null || jsonResponse.isEmpty()) {
+                return ResponseEntity.badRequest().body("API returned empty response".getBytes());
+            }
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(("Failed to call external API: " + e.getMessage()).getBytes());
+        }
+
+        InputStream templateInputStream;
+        if (file != null && !file.isEmpty()) {
+            templateInputStream = file.getInputStream();
+        } else if (templateName != null) {
+            Resource resource = new ClassPathResource("templates/" + templateName);
+            if (!resource.exists()) {
+                return ResponseEntity.badRequest().body("Template file not found".getBytes());
+            }
+            templateInputStream = resource.getInputStream();
+        } else {
+            return ResponseEntity.badRequest().body("Either 'template' parameter or 'file' must be provided".getBytes());
+        }
+
+        byte[] pdfBytes;
+        try {
+            pdfBytes = docxTemplateService.processTemplateWithJsonPathToPdf(templateInputStream, jsonResponse);
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body(("Failed to generate PDF: " + e.getMessage()).getBytes());
+        }
+
+        // Save to a file in the local filesystem (same as DOCX flow)
+        String fileName = UUID.randomUUID().toString() + ".pdf";
+        File outputFile = new File(fileName);
+        try (FileOutputStream fos = new FileOutputStream(outputFile)) {
+            fos.write(pdfBytes);
+        }
+        System.out.println("Generated PDF saved to: " + outputFile.getAbsolutePath());
+
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_PDF);
+        headers.setContentDisposition(ContentDisposition.attachment().filename("generated-document.pdf").build());
+
+        return ResponseEntity.ok()
+                .headers(headers)
+                .body(pdfBytes);
+    }
+
+    /**
      * Recursively extract JSON paths and values into a flat map
      * Supports nested objects and arrays
      * 

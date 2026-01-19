@@ -4,6 +4,8 @@ import com.jayway.jsonpath.DocumentContext;
 import com.jayway.jsonpath.JsonPath;
 import com.jayway.jsonpath.PathNotFoundException;
 import jakarta.xml.bind.JAXBElement;
+import org.docx4j.Docx4J;
+import org.docx4j.convert.out.FOSettings;
 import org.docx4j.XmlUtils;
 import org.docx4j.model.structure.HeaderFooterPolicy;
 import org.docx4j.model.structure.SectionWrapper;
@@ -27,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.xml.namespace.QName;
 
 /**
  * docx4j-based implementation of the DOCX template processor.
@@ -38,17 +41,21 @@ import java.util.regex.Pattern;
  * - {{#checkbox:$var:value}} and {{#radio:$var:value}}
  *
  * Notes:
- * - Table loops are supported; paragraph loops are not expanded (markers are removed).
+ * - Table loops and body paragraph loops are supported.
  * - Placeholders split across runs are handled by operating on concatenated w:t text per paragraph.
  */
 @Service
 public class Docx4jTemplateService {
 
+    private static final String WML_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main";
+    private static final QName QNAME_TR = new QName(WML_NS, "tr");
+
     private static final Pattern PLACEHOLDER_PATTERN = Pattern.compile("\\{\\{\\$([^}]+)\\}\\}");
     private static final Pattern CHECKBOX_PATTERN = Pattern.compile("\\{\\{#checkbox:\\s*\\$([^:]+):([^}]+)\\}\\}");
     private static final Pattern RADIO_PATTERN = Pattern.compile("\\{\\{#radio:\\s*\\$([^:]+):([^}]+)\\}\\}");
-    private static final Pattern LOOP_START_PATTERN = Pattern.compile("\\{\\{#loop:\\s*\\$([^}]+)\\}\\}");
-    private static final Pattern LOOP_END_PATTERN = Pattern.compile("\\{\\{#/loop\\}\\}");
+    // Allow whitespace around markers to tolerate Word run splits/spaces
+    private static final Pattern LOOP_START_PATTERN = Pattern.compile("\\{\\{\\s*#loop:\\s*\\$([^}]+)\\s*\\}\\}");
+    private static final Pattern LOOP_END_PATTERN = Pattern.compile("\\{\\{\\s*#/loop\\s*\\}\\}");
     private static final Pattern LOOP_ITEM_PATTERN = Pattern.compile("\\{\\{\\s*\\$([^\\[\\}]+)\\[([^\\]]+)\\]\\.([^\\}]+)\\s*\\}\\}");
 
     public byte[] processTemplatePreservingFormat(InputStream templateInputStream, Map<String, Object> data) throws IOException {
@@ -63,14 +70,158 @@ public class Docx4jTemplateService {
 
     public byte[] processTemplateWithJsonPath(InputStream templateInputStream, DocumentContext jsonContext) throws IOException {
         WordprocessingMLPackage pkg = loadPackage(templateInputStream);
+        processParagraphLoopsWithJsonPath(pkg, jsonContext);
         forEachTable(pkg, tbl -> processTableLoopsWithJsonPath(tbl, jsonContext));
         forEachParagraph(pkg, p -> processAllPlaceholdersWithJsonPath(p, jsonContext, null, -1, jsonContext, null));
         return savePackage(pkg);
     }
 
+    /**
+     * Generate a PDF by applying JSON-Path placeholder replacement, then exporting DOCX->PDF via XSL-FO.
+     */
+    public byte[] processTemplateWithJsonPathToPdf(InputStream templateInputStream, String jsonString) throws IOException {
+        return processTemplateWithJsonPathToPdf(templateInputStream, JsonPath.parse(jsonString));
+    }
+
+    /**
+     * Generate a PDF by applying JSON-Path placeholder replacement, then exporting DOCX->PDF via XSL-FO.
+     */
+    public byte[] processTemplateWithJsonPathToPdf(InputStream templateInputStream, DocumentContext jsonContext) throws IOException {
+        WordprocessingMLPackage pkg = loadPackage(templateInputStream);
+        processParagraphLoopsWithJsonPath(pkg, jsonContext);
+        forEachTable(pkg, tbl -> processTableLoopsWithJsonPath(tbl, jsonContext));
+        forEachParagraph(pkg, p -> processAllPlaceholdersWithJsonPath(p, jsonContext, null, -1, jsonContext, null));
+
+        try (ByteArrayOutputStream pdfOut = new ByteArrayOutputStream()) {
+            FOSettings foSettings = Docx4J.createFOSettings();
+            // Use setOpcPackage (preferred) so docx4j initializes FOP config correctly
+            foSettings.setOpcPackage(pkg);
+            foSettings.setApacheFopMime(FOSettings.MIME_PDF);
+            Docx4J.toFO(foSettings, pdfOut, Docx4J.FLAG_EXPORT_PREFER_XSL);
+            return pdfOut.toByteArray();
+        } catch (Exception e) {
+            throw new IOException("Failed to export PDF via docx4j: " + e.getMessage(), e);
+        }
+    }
+
     // =====================================================================================
     // Map-based paragraph replacement
     // =====================================================================================
+
+    /**
+     * Expand loop markers in paragraph blocks (outside tables) across the document,
+     * including headers and footers.
+     */
+    private void processParagraphLoopsWithJsonPath(WordprocessingMLPackage pkg, DocumentContext jsonContext) {
+        try {
+            processParagraphLoopsInContent(pkg.getMainDocumentPart().getContent(), jsonContext);
+
+            List<SectionWrapper> sections = pkg.getDocumentModel().getSections();
+            for (SectionWrapper sw : sections) {
+                HeaderFooterPolicy hfp = sw.getHeaderFooterPolicy();
+                if (hfp == null) continue;
+
+                HeaderPart dh = hfp.getDefaultHeader();
+                if (dh != null) processParagraphLoopsInContent(dh.getContent(), jsonContext);
+                HeaderPart fh = hfp.getFirstHeader();
+                if (fh != null) processParagraphLoopsInContent(fh.getContent(), jsonContext);
+                HeaderPart eh = hfp.getEvenHeader();
+                if (eh != null) processParagraphLoopsInContent(eh.getContent(), jsonContext);
+
+                FooterPart df = hfp.getDefaultFooter();
+                if (df != null) processParagraphLoopsInContent(df.getContent(), jsonContext);
+                FooterPart ff = hfp.getFirstFooter();
+                if (ff != null) processParagraphLoopsInContent(ff.getContent(), jsonContext);
+                FooterPart ef = hfp.getEvenFooter();
+                if (ef != null) processParagraphLoopsInContent(ef.getContent(), jsonContext);
+            }
+        } catch (Exception e) {
+            System.out.println("WARN: Failed to expand paragraph loops: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Expand loop markers in a given content list (outside tables).
+     *
+     * Syntax:
+     * {{#loop:$arrayPath}}
+     *   ... one or more paragraphs ...
+     * {{#/loop}}
+     */
+    @SuppressWarnings("unchecked")
+    private void processParagraphLoopsInContent(List<Object> content, DocumentContext jsonContext) {
+        if (content == null || content.isEmpty()) return;
+
+        // First, recurse into non-table nested content.
+        for (Object o : new ArrayList<>(content)) {
+            Object u = unwrap(o);
+            if (u instanceof ContentAccessor ca && !(u instanceof Tbl)) {
+                processParagraphLoopsInContent(ca.getContent(), jsonContext);
+            }
+        }
+
+        // Then process only top-level paragraph blocks inside this list.
+        for (int endIdx = content.size() - 1; endIdx >= 0; endIdx--) {
+            Object endObj = unwrap(content.get(endIdx));
+            if (!(endObj instanceof P endP)) continue;
+
+            String endText = getParagraphText(endP).fullText;
+            if (!LOOP_END_PATTERN.matcher(endText).find()) continue;
+
+            int startIdx = -1;
+            String arrayName = null;
+            for (int i = endIdx; i >= 0; i--) {
+                Object cand = unwrap(content.get(i));
+                if (!(cand instanceof P p)) continue;
+                Matcher m = LOOP_START_PATTERN.matcher(getParagraphText(p).fullText);
+                if (m.find()) {
+                    startIdx = i;
+                    arrayName = extractVariableName(m.group(1));
+                    break;
+                }
+            }
+
+            if (startIdx < 0 || arrayName == null || arrayName.isBlank()) {
+                removePatternFromParagraph(endP, LOOP_END_PATTERN);
+                continue;
+            }
+
+            List<Object> templateBlock = new ArrayList<>();
+            for (int i = startIdx + 1; i <= endIdx - 1; i++) {
+                templateBlock.add(content.get(i));
+            }
+
+            List<Object> items;
+            try {
+                Object read = jsonContext.read("$." + arrayName);
+                items = (read instanceof List) ? (List<Object>) read : new ArrayList<>();
+            } catch (Exception e) {
+                System.out.println("WARN: Loop array not found/readable for paragraph loop: $" + arrayName + " - " + e.getMessage());
+                items = new ArrayList<>();
+            }
+
+            // Remove markers and template block
+            for (int i = endIdx; i >= startIdx; i--) {
+                content.remove(i);
+            }
+
+            int insertAt = startIdx;
+            if (!items.isEmpty() && !templateBlock.isEmpty()) {
+                for (int itemIndex = 0; itemIndex < items.size(); itemIndex++) {
+                    for (Object blockObj : templateBlock) {
+                        Object cloned = XmlUtils.deepCopy(blockObj);
+                        Object unwrapped = unwrap(cloned);
+                        if (unwrapped instanceof P p) {
+                            processAllPlaceholdersWithJsonPath(p, jsonContext, arrayName, itemIndex, jsonContext, items);
+                        }
+                        content.add(insertAt++, cloned);
+                    }
+                }
+            }
+
+            endIdx = startIdx - 1;
+        }
+    }
 
     private void processParagraphWithMap(P p, Map<String, Object> data) {
         removePatternFromParagraph(p, LOOP_START_PATTERN);
@@ -156,13 +307,15 @@ public class Docx4jTemplateService {
                 if (indexStr.equalsIgnoreCase("i")) {
                     if (currentIndex >= 0) targetIndex = currentIndex;
                     else {
-                        replacements.put(fullPlaceholder, "");
+                        // Not in a loop context; do NOT blank this placeholder here.
+                        // The row-loop processor will handle it when currentIndex is known.
                         continue;
                     }
                 } else {
                     try {
                         targetIndex = Integer.parseInt(indexStr);
                     } catch (NumberFormatException e) {
+                        // Invalid index; safest is to blank it
                         replacements.put(fullPlaceholder, "");
                         continue;
                     }
@@ -232,7 +385,21 @@ public class Docx4jTemplateService {
                 String fullPlaceholder = regularMatcher.group(0);
                 if (replacements.containsKey(fullPlaceholder)) continue;
 
-                String jsonPathExpr = convertToJsonPath(extractVariableName(variablePath));
+                String variableName = extractVariableName(variablePath);
+
+                // If user wrote a loop-item placeholder using {{$array[i].prop}} but it wasn't
+                // matched by LOOP_ITEM_PATTERN (run split/whitespace edge cases), normalize it here.
+                // JSONPath does NOT accept [i], so convert it to a numeric index when we have context.
+                if (variableName != null && variableName.contains("[i]")) {
+                    if (currentIndex >= 0) {
+                        variableName = variableName.replace("[i]", "[" + currentIndex + "]");
+                    } else {
+                        // No loop context: do not wipe it here; it should be resolved inside loop processing.
+                        continue;
+                    }
+                }
+
+                String jsonPathExpr = convertToJsonPath(variableName);
                 try {
                     Object value = jsonContext.read(jsonPathExpr);
                     replacements.put(fullPlaceholder, value != null ? value.toString() : "");
@@ -317,7 +484,8 @@ public class Docx4jTemplateService {
                     for (Tr templateTr : templateCopies) {
                         Tr newTr = (Tr) XmlUtils.deepCopy(templateTr);
                         processRowForItem(newTr, jsonContext, arrayName, itemIndex, jsonContext, items);
-                        content.add(insertAt, newTr);
+                        // Add as JAXBElement to ensure docx4j marshals it correctly
+                        content.add(insertAt, new JAXBElement<>(QNAME_TR, Tr.class, newTr));
                         insertAt++;
                     }
                 }
