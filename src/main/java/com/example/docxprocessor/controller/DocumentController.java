@@ -1,6 +1,8 @@
 package com.example.docxprocessor.controller;
 
 import com.example.docxprocessor.model.TemplateData;
+import com.example.docxprocessor.model.TemplateValidationReport;
+import com.example.docxprocessor.model.TemplateValidationRequest;
 import com.example.docxprocessor.service.Docx4jTemplateService;
 import com.jayway.jsonpath.JsonPath;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -15,7 +17,6 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
-import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
@@ -268,6 +269,85 @@ public class DocumentController {
         return ResponseEntity.ok()
                 .headers(headers)
                 .body(pdfBytes);
+    }
+
+    /**
+     * Validate a template against supported syntax and sample JSON (JSONPath).
+     *
+     * Provide the template via:
+     * - template: classpath resource under templates/
+     * - file: multipart upload
+     *
+     * Provide JSON via:
+     * - request body { "jsonSample": "<raw json>" }
+     *   OR
+     * - external API params (apiUrl/method/token/requestBody), same as /generate-from-api
+     */
+    @PostMapping("/validate-template")
+    public ResponseEntity<?> validateTemplate(
+            @RequestParam(value = "template", required = false) String templateName,
+            @RequestParam(value = "file", required = false) MultipartFile file,
+            @RequestParam(value = "apiUrl", required = false, defaultValue = "http://localhost:8011/api/order") String apiUrl,
+            @RequestParam(value = "method", required = false, defaultValue = "GET") String method,
+            @RequestParam(value = "token", required = false) String jwtToken,
+            @RequestParam(value = "requestBody", required = false) String requestBodyJson,
+            @RequestHeader(value = "Authorization", required = false) String authorizationHeader,
+            @RequestBody(required = false) TemplateValidationRequest validationRequest) throws IOException {
+
+        // JSON source
+        String jsonResponse = null;
+        if (validationRequest != null && validationRequest.getJsonSample() != null && !validationRequest.getJsonSample().isEmpty()) {
+            jsonResponse = validationRequest.getJsonSample();
+        } else {
+            String token = extractJwtToken(authorizationHeader, jwtToken);
+
+            Map<String, Object> requestBody = null;
+            if (requestBodyJson != null && !requestBodyJson.isEmpty()) {
+                try {
+                    com.jayway.jsonpath.DocumentContext bodyContext = JsonPath.parse(requestBodyJson);
+                    Object bodyObj = bodyContext.json();
+                    if (bodyObj instanceof Map) {
+                        @SuppressWarnings("unchecked")
+                        Map<String, Object> bodyMap = (Map<String, Object>) bodyObj;
+                        requestBody = bodyMap;
+                    }
+                } catch (Exception e) {
+                    return ResponseEntity.badRequest().body("Invalid request body JSON: " + e.getMessage());
+                }
+            }
+
+            try {
+                jsonResponse = callExternalApi(apiUrl, method, token, requestBody);
+                if (jsonResponse == null || jsonResponse.isEmpty()) {
+                    return ResponseEntity.badRequest().body("API returned empty response");
+                }
+            } catch (Exception e) {
+                return ResponseEntity.badRequest().body("Failed to call external API: " + e.getMessage());
+            }
+        }
+
+        // Template source
+        InputStream templateInputStream;
+        if (file != null && !file.isEmpty()) {
+            templateInputStream = file.getInputStream();
+        } else if (templateName != null) {
+            Resource resource = new ClassPathResource("templates/" + templateName);
+            if (!resource.exists()) {
+                return ResponseEntity.badRequest().body("Template file not found");
+            }
+            templateInputStream = resource.getInputStream();
+        } else {
+            return ResponseEntity.badRequest().body("Either 'template' parameter or 'file' must be provided");
+        }
+
+        try {
+            TemplateValidationReport report = docxTemplateService.validateTemplateWithJsonPath(templateInputStream, jsonResponse);
+            return ResponseEntity.ok()
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(report);
+        } catch (Exception e) {
+            return ResponseEntity.badRequest().body("Failed to validate template: " + e.getMessage());
+        }
     }
 
     /**

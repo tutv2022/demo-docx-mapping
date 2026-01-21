@@ -1,5 +1,9 @@
 package com.example.docxprocessor.service;
 
+import com.example.docxprocessor.model.TemplateValidationIssue;
+import com.example.docxprocessor.model.TemplateValidationLoop;
+import com.example.docxprocessor.model.TemplateValidationPlaceholder;
+import com.example.docxprocessor.model.TemplateValidationReport;
 import com.jayway.jsonpath.DocumentContext;
 import com.jayway.jsonpath.JsonPath;
 import com.jayway.jsonpath.PathNotFoundException;
@@ -60,6 +64,7 @@ public class Docx4jTemplateService {
     private static final Pattern LOOP_START_PATTERN = Pattern.compile("\\{\\{\\s*#loop:\\s*\\$([^}]+)\\s*\\}\\}");
     private static final Pattern LOOP_END_PATTERN = Pattern.compile("\\{\\{\\s*#/loop\\s*\\}\\}");
     private static final Pattern LOOP_ITEM_PATTERN = Pattern.compile("\\{\\{\\s*\\$([^\\[\\}]+)\\[([^\\]]+)\\]\\.([^\\}]+)\\s*\\}\\}");
+    private static final Pattern ANY_TAG_PATTERN = Pattern.compile("\\{\\{[^}]+\\}\\}");
 
     // More widely-supported Unicode symbols for PDF rendering (FOP font coverage varies).
     private static final String CHECKBOX_CHECKED = "☑"; // U+2611
@@ -135,6 +140,457 @@ public class Docx4jTemplateService {
             return pdfOut.toByteArray();
         } catch (Exception e) {
             throw new IOException("Failed to export PDF via docx4j: " + e.getMessage(), e);
+        }
+    }
+
+    // =====================================================================================
+    // Validation (template syntax + JSONPath)
+    // =====================================================================================
+
+    public TemplateValidationReport validateTemplateWithJsonPath(InputStream templateInputStream, String jsonSample) throws IOException {
+        if (jsonSample == null) jsonSample = "";
+        DocumentContext ctx;
+        try {
+            ctx = JsonPath.parse(jsonSample);
+        } catch (Exception e) {
+            throw new IOException("Invalid JSON sample: " + e.getMessage(), e);
+        }
+        return validateTemplateWithJsonPath(templateInputStream, ctx);
+    }
+
+    public TemplateValidationReport validateTemplateWithJsonPath(InputStream templateInputStream, DocumentContext jsonContext) throws IOException {
+        WordprocessingMLPackage pkg = loadPackage(templateInputStream);
+
+        TemplateValidationReport report = new TemplateValidationReport();
+        List<TemplateValidationIssue> issues = new ArrayList<>();
+        List<TemplateValidationLoop> loops = new ArrayList<>();
+        Map<String, TemplateValidationPlaceholder> placeholdersByKey = new HashMap<>();
+
+        // Validate paragraph loops (outside tables) first, to validate loop-item placeholders with [i].
+        validateParagraphLoops(pkg, jsonContext, loops, issues, placeholdersByKey);
+
+        // Validate table loops.
+        forEachTable(pkg, tbl -> validateTableLoops(tbl, jsonContext, loops, issues, placeholdersByKey));
+
+        // Global scan of all paragraphs for placeholders/tags (includes header/footer).
+        forEachParagraph(pkg, p -> scanTextForTags(getParagraphText(p).fullText, jsonContext, null, -1, placeholdersByKey, issues));
+
+        // Finalize
+        report.setLoops(loops);
+        report.setIssues(issues);
+        report.setPlaceholders(new ArrayList<>(placeholdersByKey.values()));
+
+        int errors = 0;
+        int warns = 0;
+        for (TemplateValidationIssue i : issues) {
+            if ("ERROR".equalsIgnoreCase(i.getSeverity())) errors++;
+            else if ("WARN".equalsIgnoreCase(i.getSeverity())) warns++;
+        }
+        report.setErrorCount(errors);
+        report.setWarningCount(warns);
+        report.setValid(errors == 0);
+        return report;
+    }
+
+    private void validateParagraphLoops(WordprocessingMLPackage pkg,
+                                        DocumentContext jsonContext,
+                                        List<TemplateValidationLoop> loops,
+                                        List<TemplateValidationIssue> issues,
+                                        Map<String, TemplateValidationPlaceholder> placeholdersByKey) {
+        try {
+            validateParagraphLoopsInContent(pkg.getMainDocumentPart().getContent(), jsonContext, loops, issues, placeholdersByKey);
+
+            List<SectionWrapper> sections = pkg.getDocumentModel().getSections();
+            for (SectionWrapper sw : sections) {
+                HeaderFooterPolicy hfp = sw.getHeaderFooterPolicy();
+                if (hfp == null) continue;
+
+                HeaderPart dh = hfp.getDefaultHeader();
+                if (dh != null) validateParagraphLoopsInContent(dh.getContent(), jsonContext, loops, issues, placeholdersByKey);
+                HeaderPart fh = hfp.getFirstHeader();
+                if (fh != null) validateParagraphLoopsInContent(fh.getContent(), jsonContext, loops, issues, placeholdersByKey);
+                HeaderPart eh = hfp.getEvenHeader();
+                if (eh != null) validateParagraphLoopsInContent(eh.getContent(), jsonContext, loops, issues, placeholdersByKey);
+
+                FooterPart df = hfp.getDefaultFooter();
+                if (df != null) validateParagraphLoopsInContent(df.getContent(), jsonContext, loops, issues, placeholdersByKey);
+                FooterPart ff = hfp.getFirstFooter();
+                if (ff != null) validateParagraphLoopsInContent(ff.getContent(), jsonContext, loops, issues, placeholdersByKey);
+                FooterPart ef = hfp.getEvenFooter();
+                if (ef != null) validateParagraphLoopsInContent(ef.getContent(), jsonContext, loops, issues, placeholdersByKey);
+            }
+        } catch (Exception e) {
+            issues.add(new TemplateValidationIssue("WARN", "VALIDATION_FAILED", "Failed to validate paragraph loops: " + e.getMessage(), null));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void validateParagraphLoopsInContent(List<Object> content,
+                                                 DocumentContext jsonContext,
+                                                 List<TemplateValidationLoop> loops,
+                                                 List<TemplateValidationIssue> issues,
+                                                 Map<String, TemplateValidationPlaceholder> placeholdersByKey) {
+        if (content == null || content.isEmpty()) return;
+
+        // Recurse into non-table nested content.
+        for (Object o : new ArrayList<>(content)) {
+            Object u = unwrap(o);
+            if (u instanceof ContentAccessor ca && !(u instanceof Tbl)) {
+                validateParagraphLoopsInContent(ca.getContent(), jsonContext, loops, issues, placeholdersByKey);
+            }
+        }
+
+        List<Integer> pContentIdx = new ArrayList<>();
+        List<P> ps = new ArrayList<>();
+        for (int i = 0; i < content.size(); i++) {
+            Object u = unwrap(content.get(i));
+            if (u instanceof P p) {
+                pContentIdx.add(i);
+                ps.add(p);
+            }
+        }
+        if (ps.isEmpty()) return;
+
+        boolean[] startMatched = new boolean[ps.size()];
+        for (int endP = ps.size() - 1; endP >= 0; endP--) {
+            String endText = getParagraphText(ps.get(endP)).fullText;
+            if (!LOOP_END_PATTERN.matcher(endText).find()) continue;
+
+            int startP = -1;
+            String arrayName = null;
+            for (int i = endP; i >= 0; i--) {
+                Matcher sm = LOOP_START_PATTERN.matcher(getParagraphText(ps.get(i)).fullText);
+                if (sm.find()) {
+                    startP = i;
+                    arrayName = extractVariableName(sm.group(1));
+                    break;
+                }
+            }
+
+            if (startP < 0 || arrayName == null || arrayName.isBlank()) {
+                issues.add(new TemplateValidationIssue("ERROR", "LOOP_UNMATCHED_END", "Found {{#/loop}} without matching {{#loop:$...}}", "{{#/loop}}"));
+                continue;
+            }
+
+            startMatched[startP] = true;
+            TemplateValidationLoop loop = new TemplateValidationLoop("PARAGRAPH", arrayName);
+            loop.setPaired(true);
+
+            List<Object> items = null;
+            try {
+                Object read = jsonContext.read("$." + arrayName);
+                if (read instanceof List) items = (List<Object>) read;
+                else {
+                    issues.add(new TemplateValidationIssue("ERROR", "LOOP_ARRAY_NOT_LIST", "Loop array is not a JSON array: $" + arrayName, "{{#loop:$" + arrayName + "}}"));
+                }
+            } catch (PathNotFoundException e) {
+                issues.add(new TemplateValidationIssue("ERROR", "LOOP_ARRAY_NOT_FOUND", "Loop array not found in JSON: $" + arrayName, "{{#loop:$" + arrayName + "}}"));
+            } catch (Exception e) {
+                issues.add(new TemplateValidationIssue("ERROR", "LOOP_ARRAY_READ_ERROR", "Error reading loop array $" + arrayName + ": " + e.getMessage(), "{{#loop:$" + arrayName + "}}"));
+            }
+
+            if (items != null) loop.setArrayLength(items.size());
+            loops.add(loop);
+
+            int loopIndexForValidation = (items != null && !items.isEmpty()) ? 0 : -1;
+
+            // Validate tags inside the block (exclusive of marker paragraphs)
+            for (int i = startP + 1; i <= endP - 1; i++) {
+                scanTextForTags(getParagraphText(ps.get(i)).fullText, jsonContext, arrayName, loopIndexForValidation, placeholdersByKey, issues);
+            }
+
+            endP = startP - 1;
+        }
+
+        // Unmatched starts
+        for (int i = 0; i < ps.size(); i++) {
+            String txt = getParagraphText(ps.get(i)).fullText;
+            Matcher sm = LOOP_START_PATTERN.matcher(txt);
+            if (!sm.find()) continue;
+            String arrayName = extractVariableName(sm.group(1));
+            if (startMatched[i]) continue;
+            TemplateValidationLoop loop = new TemplateValidationLoop("PARAGRAPH", arrayName);
+            loop.setPaired(false);
+            loops.add(loop);
+            issues.add(new TemplateValidationIssue("ERROR", "LOOP_UNMATCHED_START", "Found {{#loop:$...}} without matching {{#/loop}}", sm.group(0)));
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private void validateTableLoops(Tbl tbl,
+                                    DocumentContext jsonContext,
+                                    List<TemplateValidationLoop> loops,
+                                    List<TemplateValidationIssue> issues,
+                                    Map<String, TemplateValidationPlaceholder> placeholdersByKey) {
+        List<Object> content = tbl.getContent();
+        if (content == null || content.isEmpty()) return;
+
+        List<Tr> trs = new ArrayList<>();
+        for (Object o : content) {
+            Object u = unwrap(o);
+            if (u instanceof Tr tr) trs.add(tr);
+        }
+        if (trs.isEmpty()) return;
+
+        boolean[] startMatched = new boolean[trs.size()];
+
+        for (int endRow = trs.size() - 1; endRow >= 0; endRow--) {
+            String endText = getRowText(trs.get(endRow));
+            if (!LOOP_END_PATTERN.matcher(endText).find()) continue;
+
+            int startRow = -1;
+            String arrayName = null;
+            for (int i = endRow; i >= 0; i--) {
+                Matcher sm = LOOP_START_PATTERN.matcher(getRowText(trs.get(i)));
+                if (sm.find()) {
+                    startRow = i;
+                    arrayName = extractVariableName(sm.group(1));
+                    break;
+                }
+            }
+            if (startRow < 0 || arrayName == null || arrayName.isBlank()) {
+                issues.add(new TemplateValidationIssue("ERROR", "LOOP_UNMATCHED_END", "Found {{#/loop}} in table without matching {{#loop:$...}}", "{{#/loop}}"));
+                continue;
+            }
+
+            startMatched[startRow] = true;
+
+            TemplateValidationLoop loop = new TemplateValidationLoop("TABLE", arrayName);
+            loop.setPaired(true);
+
+            List<Object> items = null;
+            try {
+                Object read = jsonContext.read("$." + arrayName);
+                if (read instanceof List) items = (List<Object>) read;
+                else {
+                    issues.add(new TemplateValidationIssue("ERROR", "LOOP_ARRAY_NOT_LIST", "Loop array is not a JSON array: $" + arrayName, "{{#loop:$" + arrayName + "}}"));
+                }
+            } catch (PathNotFoundException e) {
+                issues.add(new TemplateValidationIssue("ERROR", "LOOP_ARRAY_NOT_FOUND", "Loop array not found in JSON: $" + arrayName, "{{#loop:$" + arrayName + "}}"));
+            } catch (Exception e) {
+                issues.add(new TemplateValidationIssue("ERROR", "LOOP_ARRAY_READ_ERROR", "Error reading loop array $" + arrayName + ": " + e.getMessage(), "{{#loop:$" + arrayName + "}}"));
+            }
+
+            if (items != null) loop.setArrayLength(items.size());
+            loops.add(loop);
+
+            int loopIndexForValidation = (items != null && !items.isEmpty()) ? 0 : -1;
+            for (int i = startRow; i <= endRow; i++) {
+                scanTextForTags(getRowText(trs.get(i)), jsonContext, arrayName, loopIndexForValidation, placeholdersByKey, issues);
+            }
+
+            endRow = startRow - 1;
+        }
+
+        // Unmatched starts in table
+        for (int i = 0; i < trs.size(); i++) {
+            String txt = getRowText(trs.get(i));
+            Matcher sm = LOOP_START_PATTERN.matcher(txt);
+            if (!sm.find()) continue;
+            String arrayName = extractVariableName(sm.group(1));
+            if (startMatched[i]) continue;
+            TemplateValidationLoop loop = new TemplateValidationLoop("TABLE", arrayName);
+            loop.setPaired(false);
+            loops.add(loop);
+            issues.add(new TemplateValidationIssue("ERROR", "LOOP_UNMATCHED_START", "Found {{#loop:$...}} in table without matching {{#/loop}}", sm.group(0)));
+        }
+    }
+
+    private void scanTextForTags(String text,
+                                 DocumentContext jsonContext,
+                                 String loopArrayName,
+                                 int loopIndexForValidation,
+                                 Map<String, TemplateValidationPlaceholder> placeholdersByKey,
+                                 List<TemplateValidationIssue> issues) {
+        if (text == null || text.isEmpty()) return;
+
+        // Known patterns
+        extractAndValidateLoopItems(text, jsonContext, loopArrayName, loopIndexForValidation, placeholdersByKey, issues);
+        extractAndValidateCheckboxRadio(text, jsonContext, placeholdersByKey, issues);
+        extractAndValidateRegularPlaceholders(text, jsonContext, loopIndexForValidation, placeholdersByKey, issues);
+
+        // Unknown tags detection
+        Matcher any = ANY_TAG_PATTERN.matcher(text);
+        while (any.find()) {
+            String raw = any.group(0);
+            if (PLACEHOLDER_PATTERN.matcher(raw).matches()) continue;
+            if (CHECKBOX_PATTERN.matcher(raw).matches()) continue;
+            if (RADIO_PATTERN.matcher(raw).matches()) continue;
+            if (LOOP_START_PATTERN.matcher(raw).matches()) continue;
+            if (LOOP_END_PATTERN.matcher(raw).matches()) continue;
+            // Loop-item placeholders are a subset of PLACEHOLDER_PATTERN, but keep explicit.
+            if (LOOP_ITEM_PATTERN.matcher(raw).matches()) continue;
+
+            recordPlaceholder(placeholdersByKey, buildUnknownTag(raw));
+            issues.add(new TemplateValidationIssue("WARN", "UNKNOWN_TAG", "Unknown template tag found", raw));
+        }
+    }
+
+    private void extractAndValidateLoopItems(String text,
+                                            DocumentContext jsonContext,
+                                            String loopArrayName,
+                                            int loopIndexForValidation,
+                                            Map<String, TemplateValidationPlaceholder> placeholdersByKey,
+                                            List<TemplateValidationIssue> issues) {
+        Matcher m = LOOP_ITEM_PATTERN.matcher(text);
+        while (m.find()) {
+            String arrayName = m.group(1).trim();
+            String indexStr = m.group(2).trim();
+            String property = m.group(3).trim();
+            String raw = m.group(0);
+
+            boolean loopDependent = indexStr.equalsIgnoreCase("i");
+            Integer idx = null;
+            if (loopDependent) {
+                if (loopIndexForValidation >= 0) idx = loopIndexForValidation;
+            } else {
+                try { idx = Integer.parseInt(indexStr); } catch (NumberFormatException ignored) {}
+            }
+
+            String jsonPath;
+            if (idx != null) {
+                jsonPath = "$." + arrayName + "[" + idx + "]." + property;
+            } else {
+                // Can't validate i without loop context; attempt with index 0 for basic validation, but mark loopDependent.
+                jsonPath = "$." + arrayName + "[0]." + property;
+            }
+
+            TemplateValidationPlaceholder p = new TemplateValidationPlaceholder(raw, "LOOP_ITEM");
+            p.setLoopDependent(loopDependent);
+            validateJsonPath(jsonContext, jsonPath, p, issues);
+
+            if (loopDependent && loopIndexForValidation < 0) {
+                issues.add(new TemplateValidationIssue("WARN", "LOOP_INDEX_REQUIRED", "Loop-item placeholder uses [i] but no loop context was detected for validation", raw));
+                p.setMessage("Loop-dependent placeholder; validated using index [0] only.");
+            }
+
+            recordPlaceholder(placeholdersByKey, p);
+        }
+    }
+
+    private void extractAndValidateCheckboxRadio(String text,
+                                                 DocumentContext jsonContext,
+                                                 Map<String, TemplateValidationPlaceholder> placeholdersByKey,
+                                                 List<TemplateValidationIssue> issues) {
+        Matcher rb = RADIO_PATTERN.matcher(text);
+        while (rb.find()) {
+            String groupPath = rb.group(1);
+            String expected = rb.group(2);
+            String raw = rb.group(0);
+            String group = extractVariableName(groupPath);
+            String jsonPath = "$." + group;
+            TemplateValidationPlaceholder p = new TemplateValidationPlaceholder(raw, "RADIO");
+            p.setMessage("Expected value: " + expected);
+            validateJsonPath(jsonContext, jsonPath, p, issues);
+            recordPlaceholder(placeholdersByKey, p);
+        }
+
+        Matcher cb = CHECKBOX_PATTERN.matcher(text);
+        while (cb.find()) {
+            String groupPath = cb.group(1);
+            String expected = cb.group(2);
+            String raw = cb.group(0);
+            String group = extractVariableName(groupPath);
+            String jsonPath = "$." + group;
+            TemplateValidationPlaceholder p = new TemplateValidationPlaceholder(raw, "CHECKBOX");
+            p.setMessage("Expected value: " + expected);
+            validateJsonPath(jsonContext, jsonPath, p, issues);
+            recordPlaceholder(placeholdersByKey, p);
+        }
+    }
+
+    private void extractAndValidateRegularPlaceholders(String text,
+                                                       DocumentContext jsonContext,
+                                                       int loopIndexForValidation,
+                                                       Map<String, TemplateValidationPlaceholder> placeholdersByKey,
+                                                       List<TemplateValidationIssue> issues) {
+        Matcher m = PLACEHOLDER_PATTERN.matcher(text);
+        while (m.find()) {
+            String varPath = m.group(1);
+            String raw = m.group(0);
+            String variableName = extractVariableName(varPath);
+            boolean loopDependent = variableName != null && variableName.contains("[i]");
+
+            String normalized = variableName;
+            if (loopDependent) {
+                if (loopIndexForValidation >= 0) normalized = normalized.replace("[i]", "[" + loopIndexForValidation + "]");
+                else normalized = normalized.replace("[i]", "[0]");
+            }
+
+            String jsonPath = convertToJsonPath(normalized);
+            TemplateValidationPlaceholder p = new TemplateValidationPlaceholder(raw, "PLACEHOLDER");
+            p.setLoopDependent(loopDependent);
+            validateJsonPath(jsonContext, jsonPath, p, issues);
+
+            if (loopDependent && loopIndexForValidation < 0) {
+                issues.add(new TemplateValidationIssue("WARN", "LOOP_INDEX_REQUIRED", "Placeholder uses [i] but no loop context was detected for validation", raw));
+                p.setMessage("Loop-dependent placeholder; validated using index [0] only.");
+            }
+
+            recordPlaceholder(placeholdersByKey, p);
+        }
+    }
+
+    private void validateJsonPath(DocumentContext jsonContext,
+                                  String jsonPathExpr,
+                                  TemplateValidationPlaceholder p,
+                                  List<TemplateValidationIssue> issues) {
+        p.setJsonPath(jsonPathExpr);
+
+        boolean syntaxOk;
+        try {
+            JsonPath.compile(jsonPathExpr);
+            syntaxOk = true;
+        } catch (RuntimeException e) {
+            syntaxOk = false;
+            p.setJsonPathSyntaxValid(false);
+            p.setJsonPathFound(false);
+            issues.add(new TemplateValidationIssue("ERROR", "JSON_PATH_INVALID", "Invalid JSONPath syntax: " + e.getMessage(), p.getRaw()));
+            return;
+        }
+
+        p.setJsonPathSyntaxValid(syntaxOk);
+        try {
+            Object v = jsonContext.read(jsonPathExpr);
+            p.setJsonPathFound(true);
+            if (v == null) {
+                issues.add(new TemplateValidationIssue("WARN", "JSON_PATH_NULL", "JSONPath exists but value is null: " + jsonPathExpr, p.getRaw()));
+            }
+        } catch (PathNotFoundException e) {
+            p.setJsonPathFound(false);
+            issues.add(new TemplateValidationIssue("WARN", "JSON_PATH_NOT_FOUND", "JSONPath not found in JSON: " + jsonPathExpr, p.getRaw()));
+        } catch (Exception e) {
+            p.setJsonPathFound(false);
+            issues.add(new TemplateValidationIssue("WARN", "JSON_PATH_READ_ERROR", "Error reading JSONPath " + jsonPathExpr + ": " + e.getMessage(), p.getRaw()));
+        }
+    }
+
+    private TemplateValidationPlaceholder buildUnknownTag(String raw) {
+        TemplateValidationPlaceholder p = new TemplateValidationPlaceholder(raw, "UNKNOWN_TAG");
+        p.setJsonPath(null);
+        p.setJsonPathSyntaxValid(true);
+        p.setJsonPathFound(true);
+        p.setLoopDependent(false);
+        return p;
+    }
+
+    private void recordPlaceholder(Map<String, TemplateValidationPlaceholder> placeholdersByKey,
+                                   TemplateValidationPlaceholder p) {
+        String key = p.getType() + "|" + safe(p.getRaw()) + "|" + safe(p.getJsonPath());
+        TemplateValidationPlaceholder existing = placeholdersByKey.get(key);
+        if (existing == null) {
+            p.setOccurrences(1);
+            placeholdersByKey.put(key, p);
+        } else {
+            existing.setOccurrences(existing.getOccurrences() + 1);
+            // Prefer keeping first message if present; otherwise take the latest.
+            if ((existing.getMessage() == null || existing.getMessage().isBlank()) && p.getMessage() != null) {
+                existing.setMessage(p.getMessage());
+            }
+            // Upgrade flags conservatively: if any occurrence is false, keep false.
+            existing.setJsonPathSyntaxValid(existing.isJsonPathSyntaxValid() && p.isJsonPathSyntaxValid());
+            existing.setJsonPathFound(existing.isJsonPathFound() && p.isJsonPathFound());
+            existing.setLoopDependent(existing.isLoopDependent() || p.isLoopDependent());
         }
     }
 
