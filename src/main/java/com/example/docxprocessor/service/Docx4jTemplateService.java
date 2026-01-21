@@ -7,6 +7,9 @@ import jakarta.xml.bind.JAXBElement;
 import org.docx4j.Docx4J;
 import org.docx4j.convert.out.FOSettings;
 import org.docx4j.XmlUtils;
+import org.docx4j.fonts.IdentityPlusMapper;
+import org.docx4j.fonts.Mapper;
+import org.docx4j.fonts.PhysicalFonts;
 import org.docx4j.model.structure.HeaderFooterPolicy;
 import org.docx4j.model.structure.SectionWrapper;
 import org.docx4j.openpackaging.exceptions.Docx4JException;
@@ -58,6 +61,36 @@ public class Docx4jTemplateService {
     private static final Pattern LOOP_END_PATTERN = Pattern.compile("\\{\\{\\s*#/loop\\s*\\}\\}");
     private static final Pattern LOOP_ITEM_PATTERN = Pattern.compile("\\{\\{\\s*\\$([^\\[\\}]+)\\[([^\\]]+)\\]\\.([^\\}]+)\\s*\\}\\}");
 
+    // More widely-supported Unicode symbols for PDF rendering (FOP font coverage varies).
+    private static final String CHECKBOX_CHECKED = "☑"; // U+2611
+    private static final String CHECKBOX_UNCHECKED = "☐"; // U+2610
+    private static final String RADIO_SELECTED = "●"; // U+25CF
+    private static final String RADIO_UNSELECTED = "○"; // U+25CB
+
+    /**
+     * Improve PDF fidelity by configuring docx4j font mapping.
+     *
+     * docx4j-export-fo (Apache FOP) will substitute fonts if it can't find the
+     * physical fonts used in the DOCX. That often breaks symbol glyphs (checkbox/radio).
+     *
+     * This maps document fonts to installed system fonts when possible.
+     */
+    private static void configureFontsForPdf(WordprocessingMLPackage pkg) {
+        try {
+            // Limit discovery to common fonts to avoid slow full scans.
+            // Add symbol fonts commonly used for checkbox/radio glyphs.
+            String regex = "(?i).*(calibri|arial|times|helvetica|courier|dejavu|noto|symbola|segoe ui symbol|apple symbols|wingdings|webdings|symbol).*";
+            PhysicalFonts.setRegex(regex);
+            PhysicalFonts.discoverPhysicalFonts();
+
+            Mapper fontMapper = new IdentityPlusMapper();
+            pkg.setFontMapper(fontMapper);
+        } catch (Throwable t) {
+            // Don't fail generation; worst-case PDF uses fallback fonts.
+            System.out.println("WARN: Font mapping configuration failed; PDF may have reduced fidelity: " + t.getMessage());
+        }
+    }
+
     public byte[] processTemplatePreservingFormat(InputStream templateInputStream, Map<String, Object> data) throws IOException {
         WordprocessingMLPackage pkg = loadPackage(templateInputStream);
         forEachParagraph(pkg, p -> processParagraphWithMap(p, data));
@@ -96,6 +129,7 @@ public class Docx4jTemplateService {
             FOSettings foSettings = Docx4J.createFOSettings();
             // Use setOpcPackage (preferred) so docx4j initializes FOP config correctly
             foSettings.setOpcPackage(pkg);
+            configureFontsForPdf(pkg);
             foSettings.setApacheFopMime(FOSettings.MIME_PDF);
             Docx4J.toFO(foSettings, pdfOut, Docx4J.FLAG_EXPORT_PREFER_XSL);
             return pdfOut.toByteArray();
@@ -245,7 +279,7 @@ public class Docx4jTemplateService {
             String expected = cb.group(2);
             Object actual = data != null ? data.get(group) : null;
             boolean checked = actual != null && expected.equalsIgnoreCase(actual.toString());
-            replacements.put(cb.group(0), checked ? "☒" : "☐");
+            replacements.put(cb.group(0), checked ? CHECKBOX_CHECKED : CHECKBOX_UNCHECKED);
         }
 
         Matcher rb = RADIO_PATTERN.matcher(pt.fullText);
@@ -254,7 +288,7 @@ public class Docx4jTemplateService {
             String expected = rb.group(2);
             Object actual = data != null ? data.get(group) : null;
             boolean selected = actual != null && expected.equalsIgnoreCase(actual.toString());
-            replacements.put(rb.group(0), selected ? "◉" : "○");
+            replacements.put(rb.group(0), selected ? RADIO_SELECTED : RADIO_UNSELECTED);
         }
 
         applyReplacements(p, replacements);
@@ -352,9 +386,9 @@ public class Docx4jTemplateService {
                 try {
                     Object actual = jsonContext.read(jsonPathExpr);
                     boolean selected = actual != null && expected.equalsIgnoreCase(actual.toString());
-                    replacements.put(fullPlaceholder, selected ? "◉" : "○");
+                    replacements.put(fullPlaceholder, selected ? RADIO_SELECTED : RADIO_UNSELECTED);
                 } catch (Exception e) {
-                    replacements.put(fullPlaceholder, "○");
+                    replacements.put(fullPlaceholder, RADIO_UNSELECTED);
                 }
             }
         }
@@ -371,9 +405,9 @@ public class Docx4jTemplateService {
                 try {
                     Object actual = jsonContext.read(jsonPathExpr);
                     boolean checked = actual != null && expected.equalsIgnoreCase(actual.toString());
-                    replacements.put(fullPlaceholder, checked ? "☒" : "☐");
+                    replacements.put(fullPlaceholder, checked ? CHECKBOX_CHECKED : CHECKBOX_UNCHECKED);
                 } catch (Exception e) {
-                    replacements.put(fullPlaceholder, "☐");
+                    replacements.put(fullPlaceholder, CHECKBOX_UNCHECKED);
                 }
             }
         }
