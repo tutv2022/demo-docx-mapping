@@ -32,6 +32,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -175,14 +176,20 @@ public class Docx4jTemplateService {
         // Global scan of all paragraphs for placeholders/tags (includes header/footer).
         forEachParagraph(pkg, p -> scanTextForTags(getParagraphText(p).fullText, jsonContext, null, -1, placeholdersByKey, issues));
 
+        // Deduplicate issues. The same placeholder can be scanned multiple times:
+        // - once in table/loop validation block scans
+        // - again in the global paragraph scan (which also traverses inside tables)
+        // This can produce duplicate issue objects with identical content.
+        List<TemplateValidationIssue> dedupedIssues = dedupeIssues(issues);
+
         // Finalize
         report.setLoops(loops);
-        report.setIssues(issues);
+        report.setIssues(dedupedIssues);
         report.setPlaceholders(new ArrayList<>(placeholdersByKey.values()));
 
         int errors = 0;
         int warns = 0;
-        for (TemplateValidationIssue i : issues) {
+        for (TemplateValidationIssue i : dedupedIssues) {
             if ("ERROR".equalsIgnoreCase(i.getSeverity())) errors++;
             else if ("WARN".equalsIgnoreCase(i.getSeverity())) warns++;
         }
@@ -190,6 +197,21 @@ public class Docx4jTemplateService {
         report.setWarningCount(warns);
         report.setValid(errors == 0);
         return report;
+    }
+
+    private List<TemplateValidationIssue> dedupeIssues(List<TemplateValidationIssue> issues) {
+        if (issues == null || issues.isEmpty()) return issues;
+        LinkedHashMap<String, TemplateValidationIssue> uniq = new LinkedHashMap<>();
+        for (TemplateValidationIssue i : issues) {
+            if (i == null) continue;
+            String key =
+                    safe(i.getSeverity()) + "|" +
+                    safe(i.getCode()) + "|" +
+                    safe(i.getMessage()) + "|" +
+                    safe(i.getContext());
+            uniq.putIfAbsent(key, i);
+        }
+        return new ArrayList<>(uniq.values());
     }
 
     private void validateParagraphLoops(WordprocessingMLPackage pkg,
@@ -460,8 +482,11 @@ public class Docx4jTemplateService {
             validateJsonPath(jsonContext, jsonPath, p, issues);
 
             if (loopDependent && loopIndexForValidation < 0) {
-                issues.add(new TemplateValidationIssue("WARN", "LOOP_INDEX_REQUIRED", "Loop-item placeholder uses [i] but no loop context was detected for validation", raw));
-                p.setMessage("Loop-dependent placeholder; validated using index [0] only.");
+                // Only warn if this placeholder wasn't already validated in a loop context.
+                if (!isPlaceholderAlreadyValidated(placeholdersByKey, raw)) {
+                    issues.add(new TemplateValidationIssue("WARN", "LOOP_INDEX_REQUIRED", "Loop-item placeholder uses [i] but no loop context was detected for validation", raw));
+                    p.setMessage("Loop-dependent placeholder; validated using index [0] only.");
+                }
             }
 
             recordPlaceholder(placeholdersByKey, p);
@@ -523,8 +548,14 @@ public class Docx4jTemplateService {
             validateJsonPath(jsonContext, jsonPath, p, issues);
 
             if (loopDependent && loopIndexForValidation < 0) {
-                issues.add(new TemplateValidationIssue("WARN", "LOOP_INDEX_REQUIRED", "Placeholder uses [i] but no loop context was detected for validation", raw));
-                p.setMessage("Loop-dependent placeholder; validated using index [0] only.");
+                // Only warn if this placeholder wasn't already validated in a loop context.
+                // The loop validation scans placeholders with correct context first, so if
+                // a placeholder with [i] already exists in placeholdersByKey, it was likely
+                // validated correctly in a loop block.
+                if (!isPlaceholderAlreadyValidated(placeholdersByKey, raw)) {
+                    issues.add(new TemplateValidationIssue("WARN", "LOOP_INDEX_REQUIRED", "Placeholder uses [i] but no loop context was detected for validation", raw));
+                    p.setMessage("Loop-dependent placeholder; validated using index [0] only.");
+                }
             }
 
             recordPlaceholder(placeholdersByKey, p);
@@ -558,7 +589,8 @@ public class Docx4jTemplateService {
             }
         } catch (PathNotFoundException e) {
             p.setJsonPathFound(false);
-            issues.add(new TemplateValidationIssue("WARN", "JSON_PATH_NOT_FOUND", "JSONPath not found in JSON: " + jsonPathExpr, p.getRaw()));
+            // As requested: include missing JSON paths in the error list.
+            issues.add(new TemplateValidationIssue("ERROR", "JSON_PATH_NOT_FOUND", "JSONPath not found in JSON: " + jsonPathExpr, p.getRaw()));
         } catch (Exception e) {
             p.setJsonPathFound(false);
             issues.add(new TemplateValidationIssue("WARN", "JSON_PATH_READ_ERROR", "Error reading JSONPath " + jsonPathExpr + ": " + e.getMessage(), p.getRaw()));
@@ -572,6 +604,21 @@ public class Docx4jTemplateService {
         p.setJsonPathFound(true);
         p.setLoopDependent(false);
         return p;
+    }
+
+    /**
+     * Check if a placeholder with the same raw text was already validated.
+     * Used to avoid false-positive warnings when a placeholder is validated
+     * in a loop context first, then scanned again in the global pass.
+     */
+    private boolean isPlaceholderAlreadyValidated(Map<String, TemplateValidationPlaceholder> placeholdersByKey, String raw) {
+        if (raw == null || placeholdersByKey == null || placeholdersByKey.isEmpty()) return false;
+        for (TemplateValidationPlaceholder existing : placeholdersByKey.values()) {
+            if (raw.equals(existing.getRaw())) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void recordPlaceholder(Map<String, TemplateValidationPlaceholder> placeholdersByKey,
